@@ -1,0 +1,21 @@
+# OS / 编辑器产生的噪声文件（非业务文件）
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.tmp
+~$*
+.DS_Store
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 仿真 / EDA 工具产生的临时文件（若后续补充测试则自动忽略）
+*.log
+work/
+transcript
+vsim.wlf
+modelsim.ini
