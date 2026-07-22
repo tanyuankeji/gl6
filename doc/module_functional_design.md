@@ -84,35 +84,42 @@ wire addr_match = (shift_reg[7:1] == device_addr);
 
 ---
 
-### 3.0 通道状态机功能更新
+### 3.0 通道状态组合派生逻辑 (v4.0 纠正)
 
-> **重要**: 基于doc_src四个通道的状态跳转图重写。
+> **关键纠正**: 非独立FSM。由 `chip_state + reg_04 + ac_diag_en` 组合派生。
 
-**5个状态**:
+**派生算法** (纯组合逻辑, 0寄存器):
 
 ```verilog
-localparam CH_HIGH_Z          = 3'd0;
-localparam CH_MUTE            = 3'd1;
-localparam CH_PLAY            = 3'd2;
-localparam CH_SINGLE_DC_DIAG  = 3'd3;  // 新增
-localparam CH_AC_DIAG         = 3'd4;  // 新增
+wire [1:0] ch_state [0:3];
+
+generate
+    for (genvar i = 0; i < 4; i = i + 1) begin : gen_ch_state
+        // 0x04编码: 00=PLAY, 01=HI_Z, 10=MUTE, 11=DC_DIAG/AC_DIAG
+        assign ch_state[i] = (chip_state == CHIP_HI_Z || chip_state == CHIP_STANDBY)
+            ? 2'b01  // 强制Hi-Z
+            : (chip_state == CHIP_AC_DIAG && ac_diag_en[i])
+                ? 2'b11  // AC诊断 (复用11编码)
+                : ((chip_state == CHIP_SINGLE_DIAG || chip_state == CHIP_AUTO_DIAG)
+                   && reg_04[i*2+:2] == 2'b11)
+                    ? 2'b11  // DC诊断
+                    : reg_04[i*2+:2];  // 直接使用0x04
+
+        assign ch_en[i]          = (ch_state[i] == 2'b00) || (ch_state[i] == 2'b10);
+        assign ch_mute_mode[i]   = (ch_state[i] == 2'b10);
+        assign ch_diag_active[i] = (ch_state[i] == 2'b11) && (chip_state != CHIP_AC_DIAG);
+        assign ch_ac_active[i]   = (ch_state[i] == 2'b11) && (chip_state == CHIP_AC_DIAG);
+    end
+endgenerate
+
+// 0x0F寄存器组装
+assign ch_state_report = {ch_state[0], ch_state[1], ch_state[2], ch_state[3]};
 ```
 
-**通道状态机与芯片主状态机的协作**:
-
-```
-芯片主状态机状态 → 通道FSM行为:
-- CHIP_HI_Z        → 通道必须回CH_HIGH_Z
-- CHIP_PLAY/MUTE   → 通道可进入PLAY/MUTE/HIGH_Z
-- CHIP_SINGLE_DIAG → 通道可进入CH_SINGLE_DC_DIAG/CH_AC_DIAG/HIGH_Z
-- CHIP_AUTO_DIAG   → 通道可进入CH_SINGLE_DC_DIAG/CH_AC_DIAG/HIGH_Z
-```
-
-**关键设计要点**:
-- AC诊断只能从CH_HIGH_Z进入
-- 0x04配置诊断态 → 触发CH_SINGLE_DC_DIAG（需要主状态机配合）
-- 0x15/0x16配置AC诊断 → 触发CH_AC_DIAG（仅从CH_HIGH_Z）
-- STANDBY_N=0强制所有通道回CH_HIGH_Z
+**设计要点**:
+- 编码 2'b11 在不同 chip_state 下含义不同 (DC_DIAG vs AC_DIAG)
+- Hi-Z/STANDBY 强制覆盖 0x04
+- 纯组合逻辑，无时序依赖，无亚稳态风险
 
 ---
 

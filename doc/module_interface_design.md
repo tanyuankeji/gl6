@@ -83,7 +83,7 @@ tas6424e_top
 ├── i2c_slave          inst_i2c (.scl_i, .sda_io, ...)
 ├── register_file      inst_reg  (.reg_wr_en, .reg_wr_data, ...)
 ├── state_machine      inst_sm   (.chip_state, .diag_trigger, ...)
-├── channel_fsm × 4    gen_ch[0:3] (.ch_state_req, .ch_state, ...)
+├── channel_state_decoder    inst_ch_state (.chip_state, .reg_04, .ac_diag_en, .ch_fault, ...)
 ├── audio_interface    inst_audio (.sclk_i, .fsync_i, ...)
 ├── pwm_generator      inst_pwm  (.audio_data, .out_1p_o, ...)
 ├── diagnostic_ctrl    inst_diag (.diag_trigger, .diag_done, ...)
@@ -226,37 +226,37 @@ module state_machine (
 
 ---
 
-### 2.4 channel_fsm
+### 2.4 channel_state_decoder (v4.0 新增, 取代 ×4 channel_fsm)
 
 ```verilog
-module channel_fsm (
-    // 系统信号
-    input  wire         clk,
-    input  wire         rst_n,
+module channel_state_decoder (
     // 全局状态
-    input  wire [2:0]   chip_state,         // 芯片主状态 (3bit: Hi-Z/Play/Mute/Single_Diag/Auto_Diag)
-    input  wire         clear_fault,        // 清除故障
-    // 通道请求 (2bit, 来自reg 0x04对应位)
-    input  wire [1:0]   ch_state_req,       // 通道状态请求 (PLAY/Hi-Z/MUTE/DC_DIAG)
-    // 故障输入
-    input  wire         ch_fault,           // 通道故障 (来自fault_monitor)
-    // 诊断
-    input  wire         diag_done,          // 诊断完成
-    // AC诊断使能 (来自0x15/0x16)
-    input  wire         ac_diag_en,         // AC诊断使能 (仅从Hi-Z进入)
-    // 通道控制输出
-    output reg  [2:0]   ch_state,           // 通道当前状态 (3bit: 5态)
-    output reg          ch_en,              // 通道使能 (PWM)
-    output reg          ch_mute_mode,       // 静音模式
-    output reg          ch_diag_active,     // DC诊断进行中
-    output reg          ch_ac_active,       // AC诊断进行中 (新增)
-    // 故障锁存输出 (用于0x0F寄存器组装)
-    output wire         ch_fault_latched
+    input  wire [2:0]   chip_state,         // 芯片主状态 (Hi-Z/Play/Mute/Single_Diag/Auto_Diag)
+    // 寄存器配置
+    input  wire [7:0]   reg_04,             // 0x04: 4通道×2bit编码
+    // AC诊断使能
+    input  wire [3:0]   ac_diag_en,         // 来自0x15/0x16
+    // 故障输入 (用于0x0F上报)
+    input  wire [3:0]   ch_fault,           // 来自fault_monitor
+    // 通道状态输出
+    output wire [1:0]   ch_state_ch1,       // CH1状态编码
+    output wire [1:0]   ch_state_ch2,       // CH2状态编码
+    output wire [1:0]   ch_state_ch3,       // CH3状态编码
+    output wire [1:0]   ch_state_ch4,       // CH4状态编码
+    // 通道使能信号
+    output wire [3:0]   ch_en,              // 4通道PWM使能
+    output wire [3:0]   ch_mute_mode,       // 4通道静音控制
+    output wire [3:0]   ch_diag_active,     // 4通道DC诊断激活
+    output wire [3:0]   ch_ac_active,       // 4通道AC诊断激活
+    // 状态报告 (编码到0x0F寄存器格式)
+    output wire [7:0]   ch_state_report     // {CH1,CH2,CH3,CH4} ×2bit → 0x0F
 );
+
+// 纯组合逻辑, 0寄存器, ~12输入, ~28输出
+// 实现: generate for + 组合assign
 ```
 
-**每通道信号宽度**: 输入10个信号, 输出7个信号 (3bit ch_state)
-**4实例总信号**: 顶层需管理 4 × 17 = 68 根互联信号
+**总信号**: ~40根 (远少于 v3.0 的68根)
 
 ---
 

@@ -267,10 +267,10 @@ tas6424e_top                              # 顶层模块 (56引脚 + 模拟输�
 │   ├── [内部] 状态转换组合逻辑
 │   └── [内部] any_ch_diag/all_ch_hiz检测
 │
-├── channel_fsm × 4                       # 通道状态机 (4实例)
-│   ├── [内部] 组合逻辑: ch_en/ch_mute/ch_diag_active
-│   ├── [内部] 时序逻辑: ch_state锁存
-│   └── [内部] 故障锁存与恢复
+├── channel_state_decoder                  # 通道状态组合派生 (组合逻辑, 取代4×channel_fsm)
+│   ├── [内部] 通道状态编码派生 (chip_state + reg_04 → ch_state×4)
+│   ├── [内部] 通道使能信号生成 (ch_en, ch_mute, ch_diag_active, ch_ac_active)
+│   └── [内部] 通道状态上报编码 → 0x0F
 │
 ├── audio_interface                       # 串行音频接口
 │   ├── [内部] MCLK/SCLK/FSYNC 2级同步器
@@ -329,7 +329,7 @@ tas6424e_top                              # 顶层模块 (56引脚 + 模拟输�
 | `i2c_slave` | i2c_slave.v | 9 | 8 | ~350 |
 | `register_file` | register_file.v | - | 40+ (30+寄存器) | ~500 |
 | `state_machine` | state_machine.v | 5 | 2 | ~250 |
-| `channel_fsm` | channel_fsm.v | 5 | 3 | ~200 |
+| `channel_state_decoder` | channel_state_decoder.v | - (组合逻辑) | 0 (纯组合) | ~80 |
 | `audio_interface` | audio_interface.v | - | 15 | ~400 |
 | `pwm_generator` | pwm_generator.v | - | 12 | ~400 |
 | `diagnostic_ctrl` | diagnostic_ctrl.v | DC:15+AC:6 | 10 | ~450 |
@@ -337,7 +337,7 @@ tas6424e_top                              # 顶层模块 (56引脚 + 模拟输�
 | `pin_control` | pin_control.v | - | 6 | ~250 |
 | `clock_monitor` | clock_monitor.v | - | 8 | ~250 |
 | `protection` | protection.v | - | 16 | ~300 |
-| **合计** | 12文件 | - | ~130 | ~4400 |
+| **合计** | 11文件 | - | ~110 | ~3600 |
 
 ---
 
