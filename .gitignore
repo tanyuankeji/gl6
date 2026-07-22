@@ -15,6 +15,7 @@ $RECYCLE.BIN/
 
 # 仿真 / EDA 工具产生的临时文件（若后续补充测试则自动忽略）
 *.log
+*.jpg
 work/
 transcript
 vsim.wlf

@@ -1,483 +1,476 @@
-# TAS6424E-Q1 状态机设计文档
+# TAS6424E-Q1 状态机设计文档（v3.0 — 基于原始图重写）
 
-> **版本**: v1.0.0  
-> **日期**: 2026-07-14  
-> **状态**: 待审核  
-> **关联文档**: `architecture_design_v2.md`，基于datasheet §9.4/§9.5
-
----
-
-## 1. 状态机总览
-
-芯片包含以下状态机：
-
-| 状态机 | 模块 | 状态数 | 类型 | 描述 |
-|--------|------|--------|------|------|
-| 芯片主状态机 | state_machine | 5 | 两段式FSM | 控制芯片全局工作模式 |
-| 通道状态机 ×4 | channel_fsm | 4 | 组合+时序 | 每通道独立状态控制 |
-| I2C从机状态机 | i2c_slave | 9 | 两段式FSM | 标准I2C从机协议 |
-| 诊断控制器状态机 | diagnostic_ctrl | 4 | 两段式FSM | DC/AC诊断流程控制 |
+> **版本**: v3.0.0  
+> **日期**: 2026-07-22  
+> **状态**: 已重写 - 基于doc_src原始状态机图  
+> **基于**: doc_src目录下5张原始状态机图  
+> **关联文档**: 
+> - `state_machine_detailed_design.md` (本文档的详细版, 包含完整原始图复现)
+> - `architecture_design_v2.md` (架构总览)
+> - `module_functional_design.md` (模块功能)
 
 ---
 
-## 2. 芯片主状态机 (state_machine)
+## 0. 状态机层次总览
+
+```
+顶层包装 (2态/3态)  - PowerOn / STANDBY / ACT
+  │
+  └── 芯片主状态机 (5态)  - Hi-Z / Play / Mute / Single_Diag / Auto_Diag
+       │
+       └── 通道状态机 ×4 (5态)  - CH_HIGH_Z / CH_MUTE / CH_PLAY / CH_SINGLE_DC_DIAG / CH_AC_DIAG
+            │
+            ├── DC诊断FSM (15态) - IDLE/OBSERVATION + 4阶段×4通道 + DONE
+            └── AC诊断FSM (6态) - IDLE + CH1~4_AC + DONE
+```
+
+**总计 5个层级, 33个状态**
+
+---
+
+## 1. 顶层包装状态机
+
+### 1.1 状态定义
+
+```verilog
+localparam TOP_POWERON = 2'd0;  // 上电过渡
+localparam TOP_STANDBY = 2'd1;  // 待机 (最低功耗)
+localparam TOP_ACT     = 2'd2;  // 激活 (正常工作)
+```
+
+### 1.2 状态转换图
+
+```
+            ┌──────────┐
+            │ PowerOn  │
+            └─────┬────┘
+                  │ (模拟上电时序完成: DVDDPowerOn + POR_N释放)
+        ┌─────────┴─────────┐
+        │                   │
+   STANDBY_N=1         STANDBY_N=0
+        │                   │
+        ▼                   ▼
+   ┌──────────┐       ┌──────────┐
+   │ STANDBY  │◄─────►│   ACT    │
+   │ (低功耗) │ STB_N  │  (工作)  │
+   └──────────┘ !STB_N └──────────┘
+```
+
+### 1.3 转换条件
+
+| 当前态 | 下一态 | 条件 | 优先级 |
+|--------|--------|------|--------|
+| POWERON | STANDBY | POR_N释放 + STANDBY_N=1 | — |
+| POWERON | ACT | POR_N释放 + STANDBY_N=0 | — |
+| STANDBY | ACT | STANDBY_N=0 | — |
+| ACT | STANDBY | STANDBY_N=1 | 最高 |
+| STANDBY | STANDBY | STANDBY_N=1 (自保持) | — |
+| ACT | ACT | STANDBY_N=0 (自保持) | — |
+
+### 1.4 POWERON内部行为
+
+- 等待VDD上电稳定
+- 等待内部POR释放
+- 等待I2C_ADDR引脚建立 (tI2C_ADDR ≥ 300µs)
+- 等待I2C就绪 (tSTART ≤ 12ms)
+- 完成后根据STANDBY_N引脚决定进入STANDBY或ACT
+
+---
+
+## 2. 芯片主状态机
 
 ### 2.1 状态定义
 
 ```verilog
-// 5个状态编码 (3位)
-localparam CHIP_STANDBY = 3'd0;   // 待机: 振荡器停止, I2C活跃, 最低功耗
-localparam CHIP_HI_Z    = 3'd1;   // 高阻: 输出FET关断, 振荡器运行
-localparam CHIP_MUTE    = 3'd2;   // 静音: 输出FET 50%占空比开关
-localparam CHIP_PLAY    = 3'd3;   // 播放: 输出FET PWM调制, 音频输出
-localparam CHIP_DIAG    = 3'd4;   // 诊断: 通道诊断运行中
+localparam CHIP_HI_Z        = 3'd0;  // 高阻态 (默认)
+localparam CHIP_PLAY        = 3'd1;  // 播放态
+localparam CHIP_MUTE        = 3'd2;  // 静音频
+localparam CHIP_SINGLE_DIAG = 3'd3;  // 单次诊断 (MCU触发)
+localparam CHIP_AUTO_DIAG   = 3'd4;  // 自动诊断 (故障后)
 ```
 
-### 2.2 状态行为 (datasheet 表9-5)
-
-| 状态 | 输出FET | 振荡器 | I2C | 说明 |
-|------|---------|--------|-----|------|
-| STANDBY | Hi-Z | 停止 | 活跃 | 电流<1µA (PVDD), <6µA (VBAT) |
-| HI_Z | Hi-Z | 运行 | 活跃 | 等待命令, 可进入MUTE/PLAY/DIAG |
-| MUTE | 50%占空比开关 | 运行 | 活跃 | 输出FET以50%占空比开关 |
-| PLAY | 音频调制开关 | 运行 | 活跃 | 正常音频播放 |
-| DIAG | 通道Hi-Z | 运行 (诊断需要时) | 活跃 | 运行DC/AC诊断 |
-
-### 2.3 状态转换图
+### 2.2 正常态转换图
 
 ```
-                        ┌──────────────────────────────────────────────────┐
-                        │                                                  │
-                        ▼                                                  │
-                 ┌───────────────┐                                        │
-            ┌───►│   STANDBY     │◄── standby_n==0 ───────────────────────┤
-            │    │ (3'b000)      │                                        │
-            │    └───────┬───────┘                                        │
-            │            │ standby_n==1                                   │
-            │            ▼                                                │
-            │    ┌───────────────┐                                        │
-            │    │     HI_Z      │◄── diag_done ─────────────────┐        │
-            │    │  (3'b001)     │                                │        │
-            │    └───────┬───────┘                                │        │
-            │            │                                         │        │
-            │     ┌──────┼──────┐                                  │        │
-            │     │             │                                  │        │
-            │     ▼             ▼                                  │        │
-            │ ┌──────────┐ ┌──────────────┐                        │        │
-            │ │   MUTE   │ │    PLAY      │                        │        │
-            │ │ (3'b010) │ │  (3'b011)    │                        │        │
-            │ └────┬─────┘ └──────┬───────┘                        │        │
-            │      │              │                                │        │
-            │      │ any_ch_diag==1                                │        │
-            │      └──────┬───────┘                                │        │
-            │             ▼                                         │        │
-            │    ┌───────────────┐                                  │        │
-            │    │     DIAG      │── diag_done ────────────────────┘        │
-            │    │  (3'b100)     │                                         │
-            │    └───────┬───────┘                                         │
-            │            │                                                  │
-            │            │ global_fault==1                                  │
-            │            │                                                  │
-            └────────────┼──────────────────────────────────────────────────│
-                         │                                                  │
-                         └─ clear_fault ─────────────────────────────────────┤
-                           (清除故障后, 返回HI_Z或保持)                       │
-                                                                             │
-                    ┌───────────────────────────────────────────────────────┘
-                    │
-                    │ global_fault==1 (从任意非STANDBY状态)
-                    ▼
-              ┌───────────────┐
-              │     HI_Z      │ (故障处理)
-              │  (3'b001)     │
-              └───────────────┘
+    ┌──────────┐
+    │  Hi-Z态  │ ◄────────── (默认入口) ──────────┐
+    └────┬─────┘                                    │
+         │ 0x04配置停止诊断                          │ 一次诊断完成
+         │ 0x04配置诊断态                            │
+         ▼                                           │
+    ┌────────────┐                                   │
+    │ 单次诊断态 │ ──── 一次诊断完成 ───────────────►│
+    └────┬───────┘                                   │
+         │ 0x04配置Hi-Z                              │
+         │ 0x04配置播放/静音                          │
+         │ STANDBY_N=0                              │
+         ▼                                           │
+    ┌──────────┐  0x04配置/硬件引脚静音 ┌──────────┐│
+    │ 播放态   │ ◄─────── 切换 ────────►│ 静音频   ││
+    │  (Play)  │                       │  (Mute)  │┘
+    └────┬─────┘                       └────┬─────┘
+         │ 0x04配置诊断态                     │ 0x04配置诊断态
+         ▼                                   ▼
+    ┌────────────┐ ◄────────────────────── ┐│
+    │ 单次诊断态 │                        ││
+    └────────────┘ ◄──────────────────────┘│
+                                              │
+              Hi-Z态 ◄──────────────────────┘
 ```
 
-### 2.4 状态转换条件详表
+### 2.3 故障态转换图（图34 故障发生芯片状态转换图）
 
-| # | 当前状态 | 下一状态 | 转换条件 | 优先级 |
-|---|---------|---------|---------|--------|
-| 1 | 任意 | STANDBY | `standby_n==0` | 最高 |
-| 2 | 任意(非STANDBY) | HI_Z | `global_fault==1` | 高 |
-| 3 | STANDBY | HI_Z | `standby_n==1 && !global_fault` | — |
-| 4 | HI_Z | MUTE | `any_ch_mute==1 && !any_ch_play && !any_ch_diag` | — |
-| 5 | HI_Z | PLAY | `any_ch_play==1 && !any_ch_diag` | — |
-| 6 | HI_Z | DIAG | `any_ch_diag==1` | — |
-| 7 | MUTE | PLAY | `any_ch_play==1 && !any_ch_diag` | — |
-| 8 | MUTE | HI_Z | `all_ch_hiz==1` 或 `any_ch_diag==1` | — |
-| 9 | PLAY | MUTE | `any_ch_mute==1 && !any_ch_play && !any_ch_diag` | — |
-| 10 | PLAY | HI_Z | `all_ch_hiz==1` 或 `any_ch_diag==1` | — |
-| 11 | DIAG | HI_Z | `diag_done==1` | — |
-| 12 | DIAG | STANDBY | `standby_n==0` | 最高 |
-| 13 | HI_Z | HI_Z | `global_fault==1` | 高 |
-| 14 | HI_Z (故障) | HI_Z | `clear_fault==1` (故障已清除) | — |
-
-### 2.5 关键组合信号生成
-
-```verilog
-// any_ch_play: 任意通道请求PLAY
-assign any_ch_play = (ch_state_req[1:0] == CH_PLAY) ||
-                     (ch_state_req[3:2] == CH_PLAY) ||
-                     (ch_state_req[5:4] == CH_PLAY) ||
-                     (ch_state_req[7:6] == CH_PLAY);
-
-// any_ch_mute: 任意通道请求MUTE
-assign any_ch_mute = (ch_state_req[1:0]   == CH_MUTE) ||
-                     (ch_state_req[3:2] == CH_MUTE) ||
-                     (ch_state_req[5:4] == CH_MUTE) ||
-                     (ch_state_req[7:6] == CH_MUTE);
-
-// any_ch_diag: 任意通道请求DC_DIAG
-assign any_ch_diag = (ch_state_req[1:0]   == CH_DC_DIAG) ||
-                     (ch_state_req[3:2] == CH_DC_DIAG) ||
-                     (ch_state_req[5:4] == CH_DC_DIAG) ||
-                     (ch_state_req[7:6] == CH_DC_DIAG);
-
-// all_ch_hiz: 所有通道处于Hi-Z
-assign all_ch_hiz = (ch_state_req[1:0]   == CH_HI_Z) &&
-                    (ch_state_req[3:2] == CH_HI_Z) &&
-                    (ch_state_req[5:4] == CH_HI_Z) &&
-                    (ch_state_req[7:6] == CH_HI_Z);
+```
+   ┌────────────┐
+   │ 播放态      │
+   │ 静动态      │  ── 直流偏置异常/过流关断/时钟错误/其它无效 ──►  ┌──────────────┐
+   │ Hi-Z态      │                                              │  自诊断态    │
+   └────────────┘                                               │  (Auto Diag) │
+                                                                  └──────┬───────┘
+                                                                         │
+                                                                         │ 0x04指示状态位1
+                                                                         │ 异常通道已修复
+                                                                         ▼
+                                                                    ┌─────────┐
+                                                                    │ Hi-Z态  │
+                                                                    └────┬────┘
+                                                                         │ 清除错误标志位
+                                                                         │
+                                                                         ▼
+                                                                    ┌──────────┐
+                                                                    │ Hi-Z态   │
+                                                                    │ (复位状态)│
+                                                                    └──────────┘
 ```
 
-### 2.6 state_machine模块接口
+### 2.4 状态表 (datasheet 表9-5)
 
-| 信号 | 位宽 | 方向 | 描述 |
-|------|------|------|------|
-| `clk` | 1 | I | 系统时钟 |
-| `rst_n` | 1 | I | 异步复位 (低有效) |
-| `standby_n` | 1 | I | STANDBY引脚 (经去抖同步) |
-| `global_fault_irq` | 1 | I | 全局故障中断 (来自fault_monitor) |
-| `clear_fault` | 1 | I | 清除故障 (来自reg 0x21 bit7) |
-| `ch_state_req[7:0]` | 8 | I | 通道状态请求 (来自reg 0x04) |
-| `diag_done` | 1 | I | 诊断完成 (来自diagnostic_ctrl) |
-| `chip_state[2:0]` | 3 | O | 芯片当前状态 |
-| `diag_trigger` | 1 | O | 诊断触发脉冲 (1 clk) |
+| 模式名称 | 输出级FETs | 内部振荡器 | I2C |
+|---------|-----------|-----------|-----|
+| 待机 (Standby) | 高阻态 | 关闭 | 关闭 |
+| 高阻态 (Hi-Z) | 高阻态 | 工作 | 工作 |
+| 静音态 (Mute) | 50%占空比开关 | 工作 | 工作 |
+| 播放态 (Play) | 音频调制开关 | 工作 | 工作 |
+| 单次诊断态 | 高阻态（诊断中） | 工作 | 工作 |
+| 自诊断态 | 高阻态（诊断中） | 工作 | 工作 |
 
-### 2.7 RTL实现要点
+### 2.5 关键设计注释
 
-```verilog
-// 两段式FSM
-// 第一段: 状态寄存器 (时序逻辑)
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)
-        chip_state <= CHIP_STANDBY;
-    else
-        chip_state <= chip_state_next;
-end
+- **芯片上电复位处于Hi-Z态，且0x13复位标志位置1** ← 重要
+- **STANDBY引脚拉低时进入待机**；**拉高时回到原状态**
+- **从静音/播放触发待机再唤醒，会触发自动DC诊断**（除非LDG_BYPASS=1）
+- **跳过自动诊断可通过0x09 bit0 (LDG_BYPASS) 配置**
 
-// 第二段: 状态转换逻辑 (组合逻辑)
-always @(*) begin
-    chip_state_next = chip_state;  // 默认保持
-    
-    // 优先级1: STANDBY强制
-    if (!standby_n)
-        chip_state_next = CHIP_STANDBY;
-    // 优先级2: 全局故障强制Hi-Z
-    else if (global_fault_irq && (chip_state != CHIP_STANDBY))
-        chip_state_next = CHIP_HI_Z;
-    // 优先级3: 诊断触发
-    else if (any_ch_diag && (chip_state == CHIP_MUTE || chip_state == CHIP_PLAY || chip_state == CHIP_HI_Z))
-        chip_state_next = CHIP_DIAG;
-    // 优先级4: 诊断完成
-    else if (diag_done && chip_state == CHIP_DIAG)
-        chip_state_next = CHIP_HI_Z;
-    else begin
-        case (chip_state)
-            CHIP_STANDBY:
-                if (standby_n && !global_fault_irq)
-                    chip_state_next = CHIP_HI_Z;
-            CHIP_HI_Z:
-                if (any_ch_play && !any_ch_diag)
-                    chip_state_next = CHIP_PLAY;
-                else if (any_ch_mute && !any_ch_play && !any_ch_diag)
-                    chip_state_next = CHIP_MUTE;
-            CHIP_MUTE:
-                if (all_ch_hiz)
-                    chip_state_next = CHIP_HI_Z;
-                else if (any_ch_play && !any_ch_diag)
-                    chip_state_next = CHIP_PLAY;
-            CHIP_PLAY:
-                if (all_ch_hiz)
-                    chip_state_next = CHIP_HI_Z;
-                else if (any_ch_mute && !any_ch_play && !any_ch_diag)
-                    chip_state_next = CHIP_MUTE;
-            default: ;
-        endcase
-    end
-end
-```
+### 2.6 故障整体表 (datasheet 表9-6)
+
+| 故障/事件 | 类别 | 监控模式 | 报告方式 | 响应结果 |
+|----------|------|---------|---------|---------|
+| POR | 电压故障 | all | I2C + WARN引脚 | 待机 |
+| VBAT UV / PVDD UV | 电压故障 | Hi-Z, mute, play | I2C + FAULT引脚 | 高阻态 |
+| VBAT OV / PVDD OV | 电压故障 | Hi-Z, mute, play | I2C + FAULT引脚 | 高阻态 |
+| OTSD | 热关断 | Hi-Z, mute, play | I2C + FAULT引脚 | 高阻态 |
+| OTW | 热警告 | Hi-Z, mute, play | I2C + WARN引脚 | 无 |
+| 时钟错误 | 时钟 | Hi-Z, mute, play | I2C + FAULT引脚 | 自诊断态 |
+
+### 2.7 状态转换条件详表
+
+| # | 当前态 | 下一态 | 条件 | 优先级 |
+|---|--------|--------|------|--------|
+| 1 | 任意 | TOP_STANDBY | STANDBY_N=1 (顶层) | 最高 |
+| 2 | 任意(非STANDBY) | CHIP_HI_Z | global_fault=1 (PVDD/VBAT UV/OV, OTSD, 直流偏置异常, 过流关断) | 高 |
+| 3 | CHIP_HI_Z/PLAY/MUTE | CHIP_AUTO_DIAG | 时钟错误 | — |
+| 4 | CHIP_HI_Z/PLAY/MUTE | CHIP_AUTO_DIAG | 直流偏置异常 / 过流关断 / 其它无效 | — |
+| 5 | CHIP_HI_Z | CHIP_SINGLE_DIAG | 0x04配置诊断态 | — |
+| 6 | CHIP_HI_Z | CHIP_MUTE | 0x04配置静音 / 硬件引脚静音 | — |
+| 7 | CHIP_HI_Z | CHIP_PLAY | 0x04配置播放 / 硬件引脚释放 | — |
+| 8 | CHIP_PLAY | CHIP_MUTE | 0x04配置静音 / 硬件引脚静音 | — |
+| 9 | CHIP_MUTE | CHIP_PLAY | 0x04配置播放 / 硬件引脚释放 | — |
+| 10 | CHIP_PLAY/MUTE | CHIP_HI_Z | 0x04配置Hi-Z | — |
+| 11 | CHIP_PLAY/MUTE | CHIP_SINGLE_DIAG | 0x04配置诊断态 | — |
+| 12 | CHIP_SINGLE_DIAG | CHIP_HI_Z | 一次诊断完成 | — |
+| 13 | CHIP_SINGLE_DIAG | CHIP_HI_Z | 0x04配置Hi-Z (中断) | — |
+| 14 | CHIP_SINGLE_DIAG | CHIP_PLAY/MUTE | 0x04配置播放/静音 (中断) | — |
+| 15 | CHIP_AUTO_DIAG | CHIP_HI_Z | 异常通道已修复 / 0x04指示状态位1 | — |
+| 16 | CHIP_HI_Z (故障保持) | CHIP_HI_Z (复位状态) | 清除错误标志位 + 0x04指示状态位 | — |
 
 ---
 
-## 3. 通道状态机 (channel_fsm × 4)
+## 3. 通道状态机 ×4
 
 ### 3.1 状态定义
 
 ```verilog
-// 4个通道状态编码 (2位)
-localparam CH_PLAY    = 2'b00;   // 播放: 正常PWM调制
-localparam CH_HI_Z    = 2'b01;   // 高阻: 输出关断
-localparam CH_MUTE    = 2'b10;   // 静音: 50%占空比
-localparam CH_DC_DIAG = 2'b11;   // DC诊断: 输出关断, 测量负载
+localparam CH_HIGH_Z          = 3'd0;  // 高阻态
+localparam CH_MUTE            = 3'd1;  // 静音频
+localparam CH_PLAY            = 3'd2;  // 播放态
+localparam CH_SINGLE_DC_DIAG  = 3'd3;  // 单次DC诊断
+localparam CH_AC_DIAG         = 3'd4;  // AC诊断
 ```
 
-### 3.2 输出控制信号逻辑
-
-| ch_state | ch_en | ch_mute_mode | ch_diag_active | PWM行为 |
-|----------|-------|-------------|---------------|---------|
-| CH_PLAY (00) | 1 | 0 | 0 | 音频调制PWM输出 |
-| CH_HI_Z (01) | 0 | 0 | 0 | 输出强制为0 (Hi-Z) |
-| CH_MUTE (10) | 1 | 1 | 0 | 50%占空比方波输出 |
-| CH_DC_DIAG (11) | 0 | 0 | 1 | 输出关断, 等待诊断完成 |
-
-### 3.3 状态转换图
+### 3.2 状态转换图
 
 ```
-                    ┌─────────────────────────────────────────────────┐
-                    │                                                 │
-                    ▼                                                 │
-             ┌───────────────┐                                       │
-        ┌───►│    HI_Z       │◄── ch_fault_latched ─────────────────┤
-        │    │   (2'b01)     │                                       │
-        │    └───────┬───────┘                                       │
-        │            │                                               │
-        │    chip_state==PLAY/MUTE                                   │
-        │    ch_state_req==PLAY/MUTE                                 │
-        │            │                                               │
-        │     ┌──────┴──────┐                                        │
-        │     ▼             ▼                                        │
-        │ ┌──────────┐ ┌──────────────┐                                │
-        │ │  PLAY    │ │    MUTE      │                                │
-        │ │ (2'b00)  │ │  (2'b10)     │                                │
-        │ └────┬─────┘ └──────┬───────┘                                │
-        │      │              │                                        │
-        │      │ ch_state_req==HI_Z                                   │
-        │      └──────┬───────┘                                        │
-        │             ▼                                                │
-        │    ch_state_req==DC_DIAG                                     │
-        │             │                                                │
-        │             ▼                                                │
-        │    ┌───────────────┐                                        │
-        │    │   DC_DIAG     │── diag_done ──────────────────────────┤
-        │    │  (2'b11)      │                                        │
-        │    └───────┬───────┘                                        │
-        │            │                                                │
-        │            │ clear_fault (清除故障锁存)                      │
-        │            │                                                │
-        └────────────┼────────────────────────────────────────────────┘
-                     │
-                     │ chip_state==STANDBY
-                     │ (全局待机, 强制Hi-Z)
-                     │
-                     └──► CH_HI_Z
+                  ┌──────────────────────────────────────┐
+                  │                                      │
+                  ▼                                      │
+           ┌──────────────┐                             │
+           │  CH_HIGH_Z   │ ──── 配置了AC诊断 ──► CH_AC_DIAG
+           │ (默认)       │                             │
+           └──┬────────┬──┘                             │
+              │        │                                │
+              │ 0x04配置诊断态                          │
+              ▼                                        │
+   ┌──────────────────┐                                │
+   │ CH_SINGLE_DC_DIAG│                                │
+   │ (单次DC诊断)     │ ──── 0x04配置CH_PLAY ──► CH_PLAY
+   │                  │ ──── 0x04配置CH_MUTE ──► CH_MUTE
+   │                  │ ──── 一次单通道完成所有DC诊断 ──► CH_HIGH_Z
+   │                  │ ──── 异常通道完成所有DC诊断 ──► CH_HIGH_Z
+   └──────────────────┘
+   
+   ┌──────────────┐
+   │  CH_MUTE     │  ◄─── 0x04配置/CH_MUTE态 / 硬件引脚静音
+   └──────┬───────┘
+          │ 0x04配置CH_PLAY ──► CH_PLAY
+          │ 0x04配置CH_HIGH_Z ──► CH_HIGH_Z
+          │ 0x04配置诊断态 ──► CH_SINGLE_DC_DIAG
+   
+   ┌──────────────┐
+   │  CH_PLAY     │  ◄─── 0x04配置/CH_PLAY态 / 硬件引脚释放
+   └──────┬───────┘
+          │ 0x04配置CH_MUTE ──► CH_MUTE
+          │ 0x04配置CH_HIGH_Z ──► CH_HIGH_Z
+          │ 0x04配置诊断态 ──► CH_SINGLE_DC_DIAG
+   
+   ┌──────────────┐
+   │  CH_AC_DIAG  │  ◄─── 仅从CH_HIGH_Z进入
+   └──────┬───────┘
+          │ 完成AC诊断 ──► CH_HIGH_Z
 ```
 
-### 3.4 状态转换条件
+### 3.3 转换条件详表
 
-| 当前状态 | 下一状态 | 转换条件 |
-|---------|---------|---------|
-| CH_HI_Z | CH_PLAY | `chip_state==PLAY && ch_state_req==CH_PLAY && !ch_fault_latched` |
-| CH_HI_Z | CH_MUTE | `chip_state==MUTE && ch_state_req==CH_MUTE && !ch_fault_latched` |
-| CH_PLAY | CH_HI_Z | `ch_state_req==CH_HI_Z` 或 `chip_state==HI_Z` 或 `ch_fault_latched` |
-| CH_MUTE | CH_HI_Z | `ch_state_req==CH_HI_Z` 或 `chip_state==HI_Z` 或 `ch_fault_latched` |
-| CH_PLAY/MUTE | CH_DC_DIAG | `ch_state_req==CH_DC_DIAG` (chip_state变为DIAG) |
-| CH_DC_DIAG | CH_HI_Z | `diag_done==1` |
-| 任意 | CH_HI_Z | `chip_state==STANDBY` (全局强制) |
+| 当前态 | 下一态 | 条件 | 备注 |
+|--------|--------|------|------|
+| CH_HIGH_Z | CH_SINGLE_DC_DIAG | 0x04配置诊断态 + 芯片实际状态=DIAG | diag_trigger启动 |
+| CH_HIGH_Z | CH_AC_DIAG | 0x15/0x16配置AC诊断 + 芯片实际状态=DIAG | 仅从Hi-Z进入 |
+| CH_HIGH_Z | CH_PLAY | 0x04配置播放 + 芯片实际状态=PLAY/MUTE | 全局状态允许 |
+| CH_HIGH_Z | CH_MUTE | 0x04配置静音 + 芯片实际状态=PLAY/MUTE | 全局状态允许 |
+| CH_HIGH_Z | CH_HIGH_Z | 0x04配置CH_HIGH_Z (自环) | — |
+| CH_SINGLE_DC_DIAG | CH_HIGH_Z | 一次单通道完成所有DC诊断 | 正常退出 |
+| CH_SINGLE_DC_DIAG | CH_HIGH_Z | 异常通道完成所有DC诊断 | 异常修复后 |
+| CH_SINGLE_DC_DIAG | CH_PLAY | 0x04配置CH_PLAY (中断) | — |
+| CH_SINGLE_DC_DIAG | CH_MUTE | 0x04配置CH_MUTE (中断) | — |
+| CH_SINGLE_DC_DIAG | CH_AC_DIAG | 0x04配置AC诊断 (切换) | — |
+| CH_MUTE | CH_PLAY | 0x04配置CH_PLAY / 硬件引脚释放 | 正常切换 |
+| CH_MUTE | CH_SINGLE_DC_DIAG | 0x04配置诊断态 | 触发诊断 |
+| CH_MUTE | CH_HIGH_Z | 0x04配置CH_HIGH_Z | 退出 |
+| CH_PLAY | CH_MUTE | 0x04配置CH_MUTE / 硬件引脚拉低 | 正常切换 |
+| CH_PLAY | CH_SINGLE_DC_DIAG | 0x04配置诊断态 | 触发诊断 |
+| CH_PLAY | CH_HIGH_Z | 0x04配置CH_HIGH_Z | 退出 |
+| CH_PLAY | CH_HIGH_Z | 通道过流等故障 | 强制回Hi-Z |
+| CH_AC_DIAG | CH_HIGH_Z | 完成AC诊断 | 正常退出 |
+| 任意 | CH_HIGH_Z | STANDBY_N=0 / 全局故障 | 顶层/主状态机强制 |
 
-### 3.5 RTL实现要点
+### 3.4 通道使能信号逻辑
 
-```verilog
-// 每通道实例化
-// 故障锁存: ch_fault锁存在fault_latch中
-// clear_fault可清除锁存
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)
-        ch_fault_latched <= 1'b0;
-    else if (clear_fault)
-        ch_fault_latched <= 1'b0;
-    else if (ch_fault_i)
-        ch_fault_latched <= 1'b1;
-end
+| ch_state | ch_en | ch_mute_mode | ch_diag_active | ch_ac_active | PWM输出 |
+|----------|-------|-------------|---------------|--------------|---------|
+| CH_HIGH_Z (3'd0) | 0 | 0 | 0 | 0 | 高阻（输出0） |
+| CH_MUTE (3'd1) | 1 | 1 | 0 | 0 | 50%占空比方波 |
+| CH_PLAY (3'd2) | 1 | 0 | 0 | 0 | 音频调制PWM |
+| CH_SINGLE_DC_DIAG (3'd3) | 0 | 0 | 1 | 0 | 高阻（DC诊断） |
+| CH_AC_DIAG (3'd4) | 0 | 0 | 0 | 1 | 高阻（AC诊断） |
 
-// ch_en, ch_mute_mode, ch_diag_active为组合逻辑输出
-always @(*) begin
-    ch_en         = (ch_state == CH_PLAY) || (ch_state == CH_MUTE);
-    ch_mute_mode  = (ch_state == CH_MUTE);
-    ch_diag_active = (ch_state == CH_DC_DIAG);
-end
+### 3.5 与芯片主状态机的协作
+
 ```
+芯片主状态       通道可进入状态
+─────────────────────────────────────
+CHIP_HI_Z        只能CH_HIGH_Z (即使0x04配置其他)
+CHIP_PLAY        CH_PLAY / CH_MUTE / CH_HIGH_Z
+CHIP_MUTE        CH_PLAY / CH_MUTE / CH_HIGH_Z
+CHIP_SINGLE_DIAG CH_HIGH_Z / CH_SINGLE_DC_DIAG / CH_AC_DIAG
+CHIP_AUTO_DIAG   CH_HIGH_Z / CH_SINGLE_DC_DIAG / CH_AC_DIAG
+```
+
+### 3.6 关键设计注释
+
+1. **STANDBY_N取消信号会让任何0x04重新进入配置状态**
+2. **不会根据0x04进入AC诊断**（AC诊断需要0x15/0x16显式配置）
+3. **AC诊断只能在CH_HIGH_Z态进入**
+4. **CH_PLAY存在时溢载（过流）后状态是控制输出的**（强制回Hi-Z）
 
 ---
 
-## 4. I2C从机状态机 (i2c_slave)
+## 4. DC诊断状态机
 
-### 4.1 状态定义
+### 4.1 状态定义（15个）
 
 ```verilog
-localparam I2C_IDLE       = 4'd0;  // 空闲: 等待START条件
-localparam I2C_ADDR       = 4'd1;  // 地址: 接收7位地址+R/W
-localparam I2C_ACK_ADDR   = 4'd2;  // 地址确认: 发送ACK
-localparam I2C_WR_ADDR    = 4'd3;  // 写子地址: 接收8位寄存器地址
-localparam I2C_ACK_WA     = 4'd4;  // 子地址确认: 发送ACK
-localparam I2C_WR_DATA    = 4'd5;  // 写数据: 接收8位数据
-localparam I2C_ACK_WD     = 4'd6;  // 数据确认: 发送ACK
-localparam I2C_RD_DATA    = 4'd7;  // 读数据: 发送8位数据
-localparam I2C_ACK_RD     = 4'd8;  // 读确认: 接收主机ACK/NACK
+localparam DC_DIAG_IDLE        = 4'd0;
+localparam DC_DIAG_OBSERVATION = 4'd1;
+localparam DC_DIAG_CH1_S2GP    = 4'd2;
+localparam DC_DIAG_CH2_S2GP    = 4'd3;
+localparam DC_DIAG_CH3_S2GP    = 4'd4;
+localparam DC_DIAG_CH4_S2GP    = 4'd5;
+localparam DC_DIAG_CH1_SLICK   = 4'd6;
+localparam DC_DIAG_CH2_SLICK   = 4'd7;
+localparam DC_DIAG_CH3_SLICK   = 4'd8;
+localparam DC_DIAG_CH4_SLICK   = 4'd9;
+localparam DC_DIAG_CH1_LO      = 4'd10;
+localparam DC_DIAG_CH2_LO      = 4'd11;
+localparam DC_DIAG_CH3_LO      = 4'd12;
+localparam DC_DIAG_CH4_LO      = 4'd13;
+localparam DC_DONE             = 4'd14;
 ```
 
 ### 4.2 状态转换图
 
 ```
-                         ┌─────────────────────────────────────────────────┐
-                         │                                                 │
-  ┌───────┐ START ┌──────┴──┐ 8bit ┌──────────┐ ACK ┌──────────┐          │
-  │ IDLE  │──────►│  ADDR   │─────►│ ACK_ADDR │────►│ WR_ADDR  │          │
-  │ (4'd0)│       │ (4'd1)  │      │ (4'd2)   │     │ (4'd3)   │          │
-  └───┬───┘       └─────────┘      └──────────┘     └────┬─────┘          │
-      │                      ▲          ▲ R/W==1         │ ACK            │
-      │ STOP                 │ NACK     │   (读)          ▼                │
-      │                      │          │          ┌──────────┐           │
-      └──────────┐      ┌────┴──────────┘          │ ACK_WA   │           │
-                 │      │               │          │ (4'd4)   │           │
-                 │      │               │◄─────────└────┬─────┘           │
-                 │      │   读路径       │  8bit         │                 │
-                 │      │               │◄──── ACK ─────┘                 │
-                 │      │               │          ┌────▼─────┐           │
-                 │      │               │ 8bit     │ WR_DATA  │           │
-                 │      │               │◄─────────│ ACK_WD   │           │
-                 │      │               │          │ (4'd5/6) │           │
-                 │      │               │          └────┬─────┘           │
-                 │      │               │               │ ACK + STOP      │
-                 │      └───────────────┘               │                 │
-                 │                                      ▼                 │
-                 │ ┌───────┐ 8bit ┌──────────┐    ┌──────────┐           │
-                 └►│RD_DATA│─────►│ ACK_RD   │    │  IDLE    │◄──────────┘
-                   │(4'd7) │      │ (4'd8)   │    │ (4'd0)   │
-                   └───┬───┘      └────┬─────┘    └──────────┘
-                       │               │ ACK
-                       │               ▼
-                       │          ┌──────────┐
-                       └──────────│ RD_DATA  │ (顺序读: 循环)
-                                  └──────────┘
+IDLE ──► OBSERVATION ──► CH1_S2GP ──► CH2_S2GP ──► CH3_S2GP ──► CH4_S2GP
+                                                              │
+                                                              ▼
+                CH1_SLICK ◄── CH2_SLICK ◄── CH3_SLICK ◄── CH4_SLICK
+                  │             │             │             │
+                  └─────────────┴─────────────┴─────────────┘
+                                      │
+                                      ▼
+                CH1_LO  ◄──  CH2_LO  ◄──  CH3_LO  ◄──  CH4_LO
+                                                              │
+                                                              ▼
+                                                          DONE ──► IDLE
 ```
 
-### 4.3 状态描述
+### 4.3 转换条件表
 
-| 状态 | 行为 | 下一状态条件 |
-|------|------|------------|
-| IDLE | 等待START条件 (SDA↓ while SCL=H) | 检测到START → ADDR |
-| ADDR | 接收8位: 7位地址 + R/W位 | 地址匹配 → ACK_ADDR; 不匹配 → IDLE |
-| ACK_ADDR | 发送ACK (拉低SDA 1个SCL周期) | R/W=0(写) → WR_ADDR; R/W=1(读) → RD_DATA |
-| WR_ADDR | 接收8位寄存器子地址 | ACK → ACK_WA |
-| ACK_WA | 发送ACK | 继续 → WR_DATA; STOP → IDLE |
-| WR_DATA | 接收8位数据, 写入寄存器 | ACK → ACK_WD; NACK → IDLE |
-| ACK_WD | 发送ACK | 继续(顺序写) → WR_DATA; STOP → IDLE |
-| RD_DATA | 发送8位数据 (从寄存器读取) | 主机ACK → ACK_RD; NACK → IDLE |
-| ACK_RD | 接收主机ACK/NACK | ACK → RD_DATA(顺序读); NACK+STOP → IDLE |
+| 当前态 | 下一态 | 触发信号 | 含义 |
+|--------|--------|---------|------|
+| IDLE | OBSERVATION | ch_diagnostic | 启动诊断 |
+| OBSERVATION | CH1_S2GP | ch1_en | 启动CH1 S2G+S2P测试 |
+| CH1_S2GP | CH2_S2GP | ch2_en | CH1完成, 启动CH2 |
+| CH2_S2GP | CH3_S2GP | ch3_en | CH2完成, 启动CH3 |
+| CH3_S2GP | CH4_S2GP | ch4_en | CH3完成, 启动CH4 |
+| CH4_S2GP | CH1_SLICK | ch1_ol | CH4完成, 启动CH1 SL测试 |
+| CH1_SLICK | CH2_SLICK | ch2_ol | CH1完成, 启动CH2 |
+| CH2_SLICK | CH3_SLICK | ch3_ol | CH2完成, 启动CH3 |
+| CH3_SLICK | CH4_SLICK | ch4_ol | CH3完成, 启动CH4 |
+| CH4_SLICK | CH1_LO | ch1_lo | CH4完成, 启动CH1 LO测试 |
+| CH1_LO | CH2_LO | ch2_lo | CH1完成, 启动CH2 |
+| CH2_LO | CH3_LO | ch3_lo | CH2完成, 启动CH3 |
+| CH3_LO | CH4_LO | ch3_lo | CH3完成, 启动CH4 |
+| CH4_LO | DONE | done | 全部完成 |
+| DONE | IDLE | (自动) | 1clk后返回 |
+| 任意 | IDLE | abort (0x09 bit7) | 中止 |
 
-### 4.4 关键时序
+### 4.4 关键设计注释
 
-- 在SCL高电平期间SDA下降沿检测START条件
-- 在SCL高电平期间SDA上升沿检测STOP条件
-- 在SCL低电平期间更新SDA数据（输出）
-- 在SCL高电平期间采样SDA输入数据
+1. **启动chN_diagnostic完成时，可重新开始**（IDLE可接收新触发）
+2. **SL_G包含了S2G, SL_P, S2P的诊断**（S2GP阶段实际测试3项）
+3. **可同时启动SL_G测试**
+4. **OL不检查短到电源的诊断, S2P不检查SL**
+5. **自动情况则SL_G/OL**（自动诊断时执行SL_G和OL）
 
-### 4.5 子地址自增
+### 4.5 测试阶段划分
 
-```verilog
-// 顺序读写时，子地址自动递增
-// 到达0x79后回绕到0x00
-if (sequential_access) begin
-    subaddr <= (subaddr == 8'h79) ? 8'h00 : subaddr + 1'b1;
-end
-```
+| 阶段 | 状态 | 测试项 | 寄存器报告位 |
+|------|------|--------|-------------|
+| 1 (S2GP) | CH1_S2GP~CH4_S2GP | S2G (对地短路) + S2P (对电源短路) | 0x0C/0x0D bit7,6,3,2 |
+| 2 (SLICK) | CH1_SLICK~CH4_SLICK | SL (短路负载) + OL (开路) | 0x0C/0x0D bit5,4,1,0 |
+| 3 (LO) | CH1_LO~CH4_LO | LO (线路输出) | 0x0E bit3,2,1,0 |
 
 ---
 
-## 5. 诊断控制器状态机 (diagnostic_ctrl)
+## 5. AC诊断状态机
 
-### 5.1 状态定义
+### 5.1 状态定义（6个）
 
 ```verilog
-localparam DIAG_IDLE    = 2'b00;  // 空闲
-localparam DIAG_DC_RUN  = 2'b01;  // DC诊断运行
-localparam DIAG_AC_RUN  = 2'b10;  // AC诊断运行
-localparam DIAG_DONE    = 2'b11;  // 诊断完成
+localparam AC_DIAG_IDLE = 3'd0;
+localparam CH1_AC       = 3'd1;
+localparam CH2_AC       = 3'd2;
+localparam CH3_AC       = 3'd3;
+localparam CH4_AC       = 3'd4;
+localparam AC_DONE      = 3'd5;
 ```
 
 ### 5.2 状态转换图
 
 ```
-         ┌───────────┐  diag_trigger   ┌─────────────┐
-         │ DIAG_IDLE │────────────────►│ DIAG_DC_RUN │
-         │  (2'b00)  │                 │  (2'b01)    │
-         └─────▲─────┘                 └──────┬──────┘
-               │                              │
-               │                     timer_done (DC完成)
-               │                              │
-               │              ┌───────────────┘
-               │              ▼
-               │       ┌─────────────┐
-               │       │  DIAG_DONE  │
-               │       │  (2'b11)    │
-               │       └──────┬──────┘
-               │              │
-               │       ┌──────┴──────────────────┐
-               │       │                         │
-               │       │ AC诊断使能?              │
-               │       │ (ac_diag_en)             │
-               │       ▼                         ▼
-               │  ┌─────────────┐          ┌───────────┐
-               │  │ DIAG_AC_RUN │          │  自动返回  │
-               │  │  (2'b10)    │          │ DIAG_IDLE  │
-               │  └──────┬──────┘          └───────────┘
-               │         │
-               │         │ timer_done (AC完成)
-               │         │
-               └─────────┘
+IDLE ──► CH1_AC ──► CH2_AC ──► CH3_AC ──► CH4_AC ──► DONE ──► IDLE
 ```
 
-### 5.3 诊断时序参数
+### 5.3 转换条件表
 
-| 参数 | 值 | 描述 |
-|------|-----|------|
-| DC诊断时间 (4通道) | ~230ms (typ) | datasheet §7.5 |
-| AC诊断时间 (4通道) | ~520ms (typ) | datasheet §7.5 |
-| 线路输出诊断时间 | ~40ms (typ) | datasheet §7.5 |
-| RTL DIAG_TIMEOUT_CYCLES | 24'hFFFFF | ~100ms @10MHz (可调) |
+| 当前态 | 下一态 | 触发信号 |
+|--------|--------|---------|
+| IDLE | CH1_AC | ch1_en |
+| CH1_AC | CH2_AC | ch2_en |
+| CH2_AC | CH3_AC | ch3_en |
+| CH3_AC | CH4_AC | ch4_en |
+| CH4_AC | AC_DONE | done |
+| AC_DONE | IDLE | (自动) |
+| 任意 | IDLE | abort |
 
-### 5.4 诊断流程
+### 5.4 AC诊断特点
 
-**DC诊断流程**:
-1. MCU写0x04寄存器 → 通道设为CH_DC_DIAG
-2. state_machine检测 → DIAG态 → diag_trigger脉冲
-3. diagnostic_ctrl → DIAG_DC_RUN, 启动计时器
-4. 模拟前端施加测试电流，测量电压（RTL中为抽象建模）
-5. 计时器到期 → 生成诊断报告 → 写入0x0C-0x0E
-6. → DIAG_DONE → 1clk后 → DIAG_IDLE
-7. diag_done → state_machine退出DIAG
-
-**DC诊断结果编码** (每通道每项1位):
-
-| 编码 | 测试项 | 含义 |
-|------|--------|------|
-| S2G | 对地短路 | 1=短路到GND (阻抗<200Ω) |
-| S2P | 对电源短路 | 1=短路到PVDD (阻抗<500Ω) |
-| OL | 开路 | 1=开路 (阻抗>40~70Ω) |
-| SL | 负载短路 | 1=负载短路 (低于阈值) |
+- 顺序执行：CH1→CH2→CH3→CH4
+- 每通道独立测量阻抗/相位
+- 总时间：~520ms (typ)
+- 单通道时间：~130ms (typ)
 
 ---
 
-## 6. 设计检查清单
+## 6. 状态机间交互关系
 
-- [ ] 芯片主状态机5个状态是否完整覆盖datasheet表9-5
-- [ ] standby_n最高优先级是否正确实现
-- [ ] global_fault_irq是否在任何非STANDBY状态都强制回HI_Z
-- [ ] 通道状态机的ch_fault_latched是否正确使用clear_fault清除
-- [ ] I2C FSM是否正确处理START/STOP/RESTART条件
-- [ ] I2C子地址自增是否正确回绕
-- [ ] 诊断FSM在DIAG_DONE后是否正确返回DIAG_IDLE
-- [ ] 诊断超时计数器是否可配置
-- [ ] 所有FSM复位后是否回到正确的初始状态
-- [ ] 是否避免了组合逻辑环路和锁存器
+### 6.1 层级关系
+
+```
+TOP ──► 芯片主 ──► 通道 ──► DC/AC诊断
+ │
+ │   强制STANDBY
+ │
+ └─► 所有FSM都冻结
+
+芯片主 ──► 通道
+ │   强制CH_HIGH_Z
+ │
+ └─► 通道必须配合
+
+通道 ──► DC/AC诊断
+ │   启动ch_diagnostic
+ │
+ └─► DC/AC FSM开始运行
+```
+
+### 6.2 关键信号
+
+| 信号 | 源 | 目标 | 作用 |
+|------|-----|------|------|
+| STANDBY_N | 引脚(经去抖) | 顶层/主状态机/通道 | 强制STANDBY |
+| chip_state[2:0] | 主状态机 | 通道状态机 | 全局模式 |
+| ch_state_req[7:0] | 寄存器0x04 | 通道状态机 | 用户配置 |
+| ch_state[1:0] ×4 | 通道状态机 | 寄存器0x0F | 状态报告 |
+| ch_diagnostic[3:0] | 主状态机/0x04 | DC诊断FSM | 启动DC诊断 |
+| ch_ac_diagnostic[3:0] | 0x15/0x16 | AC诊断FSM | 启动AC诊断 |
+| diag_done | DC/AC FSM | 主状态机 | 诊断完成 |
+| chN_en | DC/AC FSM | DC/AC FSM内部 | 通道间顺序触发 |
+
+---
+
+## 7. 设计检查清单
+
+- [ ] 顶层3态FSM (PowerOn/Standby/Act) 是否与上电时序匹配
+- [ ] 芯片主状态机5态是否完整（Hi-Z/Play/Mute/Single_Diag/Auto_Diag）
+- [ ] 通道状态机5态是否完整（High_Z/Mute/Play/Single_DC_Diag/AC_Diag）
+- [ ] 通道CH_AC_DIAG是否仅从CH_HIGH_Z进入
+- [ ] DC诊断FSM是否15态顺序正确
+- [ ] DC诊断的S2GP/SLICK/LO三个阶段是否正确
+- [ ] AC诊断FSM是否6态顺序正确
+- [ ] 各FSM的abort机制是否正确
+- [ ] STANDBY_N=0的全局强制是否覆盖所有FSM
+- [ ] 主FSM与通道FSM的协作关系是否清晰
+- [ ] diag_done信号是否正确触发主状态机退出诊断态
+- [ ] 自动诊断(Single_Diag vs Auto_Diag)的区分是否清晰
+- [ ] 故障后从PLAY/MUTE回Hi-Z的路径是否覆盖
+- [ ] 异常通道完成DC后回Hi-Z的条件是否正确

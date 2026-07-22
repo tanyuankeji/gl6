@@ -84,6 +84,38 @@ wire addr_match = (shift_reg[7:1] == device_addr);
 
 ---
 
+### 3.0 通道状态机功能更新
+
+> **重要**: 基于doc_src四个通道的状态跳转图重写。
+
+**5个状态**:
+
+```verilog
+localparam CH_HIGH_Z          = 3'd0;
+localparam CH_MUTE            = 3'd1;
+localparam CH_PLAY            = 3'd2;
+localparam CH_SINGLE_DC_DIAG  = 3'd3;  // 新增
+localparam CH_AC_DIAG         = 3'd4;  // 新增
+```
+
+**通道状态机与芯片主状态机的协作**:
+
+```
+芯片主状态机状态 → 通道FSM行为:
+- CHIP_HI_Z        → 通道必须回CH_HIGH_Z
+- CHIP_PLAY/MUTE   → 通道可进入PLAY/MUTE/HIGH_Z
+- CHIP_SINGLE_DIAG → 通道可进入CH_SINGLE_DC_DIAG/CH_AC_DIAG/HIGH_Z
+- CHIP_AUTO_DIAG   → 通道可进入CH_SINGLE_DC_DIAG/CH_AC_DIAG/HIGH_Z
+```
+
+**关键设计要点**:
+- AC诊断只能从CH_HIGH_Z进入
+- 0x04配置诊断态 → 触发CH_SINGLE_DC_DIAG（需要主状态机配合）
+- 0x15/0x16配置AC诊断 → 触发CH_AC_DIAG（仅从CH_HIGH_Z）
+- STANDBY_N=0强制所有通道回CH_HIGH_Z
+
+---
+
 ## 3. 寄存器文件模块 (register_file)
 
 ### 3.1 功能描述
@@ -526,32 +558,212 @@ end
 
 ## 8. 诊断控制器模块 (diagnostic_ctrl)
 
-### 8.1 DC诊断流程
+> **重要**: 本节基于doc_src原始状态机图（DC诊断的状态跳转.jpg、AC诊断的状态跳转.jpg）重写。
+
+### 8.1 DC诊断状态机（15个状态）
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    DC诊断流程                                │
-│                                                              │
-│  1. diag_trigger脉冲                                         │
-│     ↓                                                        │
-│  2. 状态 → DIAG_DC_RUN                                      │
-│     ↓                                                        │
-│  3. 诊断计时器启动 (模拟前端测量)                             │
-│     ↓                                                        │
-│  4. 计时器到期 → 锁存诊断结果                                │
-│     ↓                                                        │
-│  5. 生成诊断报告:                                            │
-│     - 读取s2g_ch[3:0], s2p_ch[3:0], ol_ch[3:0], sl_ch[3:0] │
-│     - 编码到dc_diag_rpt1/2/3寄存器格式                       │
-│     ↓                                                        │
-│  6. 硬件写入寄存器文件 0x0C-0x0E                             │
-│     ↓                                                        │
-│  7. 状态 → DIAG_DONE (1clk) → DIAG_IDLE                     │
-│     diag_done脉冲输出                                        │
-└─────────────────────────────────────────────────────────────┘
+IDLE ──► OBSERVATION ──► CH1_S2GP ──► CH2_S2GP ──► CH3_S2GP ──► CH4_S2GP
+            ↑                                                    │
+            │                                                    ▼
+            │        CH1_SLICK ◄── CH2_SLICK ◄── CH3_SLICK ◄── CH4_SLICK
+            │          │             │             │             │
+            │          └─────────────┴─────────────┴─────────────┘
+            │                                       │
+            │                                       ▼
+            │        CH1_LO  ◄──  CH2_LO  ◄──  CH3_LO  ◄──  CH4_LO
+            │                                                    │
+            └──────────────── DONE ───────────────────────────────┘
 ```
 
-### 8.2 诊断计时器
+#### 8.1.1 状态编码
+
+```verilog
+// 4位状态编码
+localparam DC_DIAG_IDLE        = 4'd0;
+localparam DC_DIAG_OBSERVATION = 4'd1;  // 启动准备
+localparam DC_DIAG_CH1_S2GP    = 4'd2;  // CH1 S2G+S2P测试
+localparam DC_DIAG_CH2_S2GP    = 4'd3;
+localparam DC_DIAG_CH3_S2GP    = 4'd4;
+localparam DC_DIAG_CH4_S2GP    = 4'd5;
+localparam DC_DIAG_CH1_SLICK   = 4'd6;  // CH1 SL+OL测试
+localparam DC_DIAG_CH2_SLICK   = 4'd7;
+localparam DC_DIAG_CH3_SLICK   = 4'd8;
+localparam DC_DIAG_CH4_SLICK   = 4'd9;
+localparam DC_DIAG_CH1_LO      = 4'd10; // CH1 LO测试
+localparam DC_DIAG_CH2_LO      = 4'd11;
+localparam DC_DIAG_CH3_LO      = 4'd12;
+localparam DC_DIAG_CH4_LO      = 4'd13;
+localparam DC_DONE             = 4'd14;
+```
+
+#### 8.1.2 状态转换逻辑
+
+```verilog
+// 15状态FSM - 顺序执行三个测试阶段
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        dc_diag_state <= DC_DIAG_IDLE;
+    end else if (dc_ldg_abort) begin
+        // 中止诊断
+        dc_diag_state <= DC_DIAG_IDLE;
+    end else begin
+        case (dc_diag_state)
+            DC_DIAG_IDLE:
+                if (ch_diagnostic_any)
+                    dc_diag_state <= DC_DIAG_OBSERVATION;
+                else
+                    dc_diag_state <= DC_DIAG_IDLE;
+            DC_DIAG_OBSERVATION:
+                if (obs_timer_done)
+                    dc_diag_state <= DC_DIAG_CH1_S2GP;
+            DC_DIAG_CH1_S2GP:
+                if (ch1_s2gp_done)
+                    dc_diag_state <= DC_DIAG_CH2_S2GP;
+            DC_DIAG_CH2_S2GP:
+                if (ch2_s2gp_done)
+                    dc_diag_state <= DC_DIAG_CH3_S2GP;
+            DC_DIAG_CH3_S2GP:
+                if (ch3_s2gp_done)
+                    dc_diag_state <= DC_DIAG_CH4_S2GP;
+            DC_DIAG_CH4_S2GP:
+                if (ch4_s2gp_done)
+                    dc_diag_state <= DC_DIAG_CH1_SLICK;
+            DC_DIAG_CH1_SLICK:
+                if (ch1_slick_done)
+                    dc_diag_state <= DC_DIAG_CH2_SLICK;
+            DC_DIAG_CH2_SLICK:
+                if (ch2_slick_done)
+                    dc_diag_state <= DC_DIAG_CH3_SLICK;
+            DC_DIAG_CH3_SLICK:
+                if (ch3_slick_done)
+                    dc_diag_state <= DC_DIAG_CH4_SLICK;
+            DC_DIAG_CH4_SLICK:
+                if (ch4_slick_done)
+                    dc_diag_state <= DC_DIAG_CH1_LO;
+            DC_DIAG_CH1_LO:
+                if (ch1_lo_done)
+                    dc_diag_state <= DC_DIAG_CH2_LO;
+            DC_DIAG_CH2_LO:
+                if (ch2_lo_done)
+                    dc_diag_state <= DC_DIAG_CH3_LO;
+            DC_DIAG_CH3_LO:
+                if (ch3_lo_done)
+                    dc_diag_state <= DC_DIAG_CH4_LO;
+            DC_DIAG_CH4_LO:
+                if (ch4_lo_done)
+                    dc_diag_state <= DC_DONE;
+            DC_DONE:
+                dc_diag_state <= DC_DIAG_IDLE;  // 1clk后返回
+        endcase
+    end
+end
+```
+
+#### 8.1.3 通道使能信号生成 (ch1_en~ch4_en, ch1_ol~ch4_ol, ch1_lo~ch4_lo)
+
+```verilog
+// 阶段1: S2GP测试 - ch1_en~ch4_en 顺序触发
+assign ch1_en = (dc_diag_state == DC_DIAG_CH1_S2GP);
+assign ch2_en = (dc_diag_state == DC_DIAG_CH2_S2GP);
+assign ch3_en = (dc_diag_state == DC_DIAG_CH3_S2GP);
+assign ch4_en = (dc_diag_state == DC_DIAG_CH4_S2GP);
+
+// 阶段2: SLICK测试 - ch1_ol~ch4_ol 顺序触发
+assign ch1_ol = (dc_diag_state == DC_DIAG_CH1_SLICK);
+assign ch2_ol = (dc_diag_state == DC_DIAG_CH2_SLICK);
+assign ch3_ol = (dc_diag_state == DC_DIAG_CH3_SLICK);
+assign ch4_ol = (dc_diag_state == DC_DIAG_CH4_SLICK);
+
+// 阶段3: LO测试 - ch1_lo~ch4_lo 顺序触发
+assign ch1_lo = (dc_diag_state == DC_DIAG_CH1_LO);
+assign ch2_lo = (dc_diag_state == DC_DIAG_CH2_LO);
+assign ch3_lo = (dc_diag_state == DC_DIAG_CH3_LO);
+assign ch4_lo = (dc_diag_state == DC_DIAG_CH4_LO);
+
+assign done = (dc_diag_state == DC_DIAG_CH4_LO && ch4_lo_timer_done);
+```
+
+#### 8.1.4 DC诊断报告编码
+
+```verilog
+// 0x0C: DC Load Diagnostic Report 1 (CH1+CH2)
+assign dc_diag_rpt1 = {s2g_ch[0], s2p_ch[0], ol_ch[0], sl_ch[0],
+                       s2g_ch[1], s2p_ch[1], ol_ch[1], sl_ch[1]};
+
+// 0x0D: DC Load Diagnostic Report 2 (CH3+CH4) — 同上格式
+// 0x0E: DC Load Diagnostic Report 3 (Line Output)
+assign dc_diag_rpt3 = {4'b0000, lo_ch[3:0]};
+```
+
+#### 8.1.5 关键设计注释
+
+1. **启动chN_diagnostic完成时，可重新开始**（IDLE可接收新触发）
+2. **SL_G包含了S2G, SL_P, S2P的诊断**（S2GP阶段实际测试3项）
+3. **OL不检查短到电源的诊断, S2P不检查SL**
+4. **自动诊断情况则执行SL_G/OL**（跳过LO）
+5. **每阶段内部使用4个顺序子状态**
+
+### 8.2 AC诊断状态机（6个状态）
+
+```
+IDLE ──► CH1_AC ──► CH2_AC ──► CH3_AC ──► CH4_AC ──► DONE ──► IDLE
+```
+
+#### 8.2.1 状态编码
+
+```verilog
+localparam AC_DIAG_IDLE = 3'd0;
+localparam CH1_AC       = 3'd1;
+localparam CH2_AC       = 3'd2;
+localparam CH3_AC       = 3'd3;
+localparam CH4_AC       = 3'd4;
+localparam AC_DONE      = 3'd5;
+```
+
+#### 8.2.2 状态转换逻辑
+
+```verilog
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        ac_diag_state <= AC_DIAG_IDLE;
+    end else if (ac_ldg_abort) begin
+        ac_diag_state <= AC_DIAG_IDLE;
+    end else begin
+        case (ac_diag_state)
+            AC_DIAG_IDLE:
+                if (ac_diag_en[0])  // CH1使能
+                    ac_diag_state <= CH1_AC;
+            CH1_AC:
+                if (ch1_ac_done)
+                    ac_diag_state <= CH2_AC;
+            CH2_AC:
+                if (ch2_ac_done)
+                    ac_diag_state <= CH3_AC;
+            CH3_AC:
+                if (ch3_ac_done)
+                    ac_diag_state <= CH4_AC;
+            CH4_AC:
+                if (ch4_ac_done)
+                    ac_diag_state <= AC_DONE;
+            AC_DONE:
+                ac_diag_state <= AC_DIAG_IDLE;  // 1clk后返回
+        endcase
+    end
+end
+```
+
+#### 8.2.3 通道使能信号生成
+
+```verilog
+// AC诊断每通道顺序执行
+assign ch1_en_ac = (ac_diag_state == CH1_AC);
+assign ch2_en_ac = (ac_diag_state == CH2_AC);
+assign ch3_en_ac = (ac_diag_state == CH3_AC);
+assign ch4_en_ac = (ac_diag_state == CH4_AC);
+```
+
+### 8.3 诊断计时器
 
 ```verilog
 // DC诊断计时器
@@ -564,17 +776,12 @@ wire [23:0] timer_limit = dc_diag_ctrl1[6] ?
     DIAG_TIMEOUT_CYCLES;
 ```
 
-### 8.3 诊断报告编码
+### 8.4 诊断时间分配
 
-```verilog
-// 0x0C: DC Load Diagnostic Report 1 (CH1+CH2)
-assign dc_diag_rpt1 = {s2g_ch[0], s2p_ch[0], ol_ch[0], sl_ch[0],
-                       s2g_ch[1], s2p_ch[1], ol_ch[1], sl_ch[1]};
-
-// 0x0D: DC Load Diagnostic Report 2 (CH3+CH4) — 同上格式
-// 0x0E: DC Load Diagnostic Report 3 (Line Output)
-assign dc_diag_rpt3 = {4'b0000, lo_ch[3:0]};
-```
+| 诊断类型 | 总时间 | 单项时间 | 通道数 | 阶段数 |
+|---------|--------|---------|--------|--------|
+| DC完整诊断 | ~230ms (typ) | ~19ms | 4 | 3 (S2GP/SLICK/LO) |
+| AC顺序诊断 | ~520ms (typ) | ~130ms | 4 | 1 (顺序) |
 
 ---
 

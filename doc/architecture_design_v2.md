@@ -6,9 +6,10 @@
 > **基于**: TI TAS6424E-Q1 数据手册 (ZHCSO75A, 2021年11月修订版A)
 >
 > **关联文档**: 
+> - `state_machine_detailed_design.md` — 状态机详细设计 (基于doc_src原始图)
+> - `fsm_design.md` — 状态机总览 (v3.0)
 > - `clock_reset_design.md` — 时钟与复位设计
 > - `register_map_design.md` — 寄存器映射详细设计
-> - `fsm_design.md` — 状态机设计
 > - `module_interface_design.md` — 模块接口设计
 > - `timing_diagram.md` — 时序图
 > - `module_functional_design.md` — 模块功能设计
@@ -287,8 +288,9 @@ tas6424e_top                              # 顶层模块 (56引脚 + 模拟输�
 │   └── [内部] Hi-Z模式输出禁用
 │
 ├── diagnostic_ctrl                       # 诊断控制器
-│   ├── [内部] 诊断FSM (IDLE→DC_RUN→AC_RUN→DONE)
-│   ├── [内部] 诊断计时器
+│   ├── [内部] DC诊断FSM (15状态: IDLE/OBSERVATION/4阶段×4通道/DONE)
+│   ├── [内部] AC诊断FSM (6状态: IDLE/CH1~4_AC/DONE)
+│   ├── [内部] DC/AC诊断计时器
 │   ├── [内部] 诊断报告生成
 │   └── [内部] DC/AC模式选择
 │
@@ -326,16 +328,16 @@ tas6424e_top                              # 顶层模块 (56引脚 + 模拟输�
 | `tas6424e_top` | tas6424e_top.v | - | 0 (仅连线) | ~600 |
 | `i2c_slave` | i2c_slave.v | 9 | 8 | ~350 |
 | `register_file` | register_file.v | - | 40+ (30+寄存器) | ~500 |
-| `state_machine` | state_machine.v | 5 | 2 | ~200 |
-| `channel_fsm` | channel_fsm.v | 4 | 3 | ~150 |
+| `state_machine` | state_machine.v | 5 | 2 | ~250 |
+| `channel_fsm` | channel_fsm.v | 5 | 3 | ~200 |
 | `audio_interface` | audio_interface.v | - | 15 | ~400 |
 | `pwm_generator` | pwm_generator.v | - | 12 | ~400 |
-| `diagnostic_ctrl` | diagnostic_ctrl.v | 4 | 10 | ~350 |
+| `diagnostic_ctrl` | diagnostic_ctrl.v | DC:15+AC:6 | 10 | ~450 |
 | `fault_monitor` | fault_monitor.v | - | 12 | ~400 |
 | `pin_control` | pin_control.v | - | 6 | ~250 |
 | `clock_monitor` | clock_monitor.v | - | 8 | ~250 |
 | `protection` | protection.v | - | 16 | ~300 |
-| **合计** | 12文件 | - | ~130 | ~4150 |
+| **合计** | 12文件 | - | ~130 | ~4400 |
 
 ---
 
@@ -491,12 +493,35 @@ tas6424e_top                              # 顶层模块 (56引脚 + 模拟输�
 
 ## 11. 工作模式转换 (datasheet 表9-5)
 
+**5层状态机层次**:
+
+```
+顶层包装 (3态) → 芯片主状态机 (5态) → 通道状态机×4 (5态) → DC/AC诊断FSM
+   │                  │                    │
+PowerOn            Hi-Z                 CH_HIGH_Z
+STANDBY            Play                 CH_MUTE
+ACT                Mute                 CH_PLAY
+                   Single_Diag          CH_SINGLE_DC_DIAG
+                   Auto_Diag            CH_AC_DIAG
+```
+
 | 状态 | 输出FET | 振荡器 | I2C | 转换条件 |
 |------|---------|--------|-----|---------|
-| STANDBY | Hi-Z | 停止 | 活跃 | standby_n=0 (默认) |
-| Hi-Z | Hi-Z | 运行 | 活跃 | standby_n=1 或 故障后恢复 |
-| MUTE | 50%占空比开关 | 运行 | 活跃 | 通道配置为MUTE |
-| PLAY | 音频调制开关 | 运行 | 活跃 | 通道配置为PLAY |
+| STANDBY (顶层) | Hi-Z | 停止 | 关闭 | STANDBY_N=1 |
+| ACT (顶层) | (主状态机决定) | 运行 | 活跃 | STANDBY_N=0 |
+| Hi-Z (主) | Hi-Z | 运行 | 活跃 | 默认/故障/0x04配置Hi-Z |
+| Mute (主) | 50%占空比开关 | 运行 | 活跃 | 0x04配置静音/硬件MUTE |
+| Play (主) | 音频调制开关 | 运行 | 活跃 | 0x04配置播放 |
+| Single_Diag (主) | Hi-Z (诊断中) | 运行 | 活跃 | 0x04配置诊断态 |
+| Auto_Diag (主) | Hi-Z (诊断中) | 运行 | 活跃 | 故障时自动进入 |
+
+**关键设计注释**:
+- 芯片上电复位处于Hi-Z态，且0x13复位标志位置1
+- 芯片在任何状态，STANDBY引脚拉低时进入待机；拉高时回到原状态
+- 从静音/播放触发待机再唤醒，会触发自动DC诊断（除非LDG_BYPASS=1）
+- AC诊断只能从CH_HIGH_Z进入
+
+> 完整状态机转换图详见 `state_machine_detailed_design.md`
 
 ---
 

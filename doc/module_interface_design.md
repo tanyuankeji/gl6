@@ -234,26 +234,29 @@ module channel_fsm (
     input  wire         clk,
     input  wire         rst_n,
     // 全局状态
-    input  wire [2:0]   chip_state,         // 芯片主状态
+    input  wire [2:0]   chip_state,         // 芯片主状态 (3bit: Hi-Z/Play/Mute/Single_Diag/Auto_Diag)
     input  wire         clear_fault,        // 清除故障
     // 通道请求 (2bit, 来自reg 0x04对应位)
-    input  wire [1:0]   ch_state_req,       // 通道状态请求
+    input  wire [1:0]   ch_state_req,       // 通道状态请求 (PLAY/Hi-Z/MUTE/DC_DIAG)
     // 故障输入
     input  wire         ch_fault,           // 通道故障 (来自fault_monitor)
     // 诊断
     input  wire         diag_done,          // 诊断完成
+    // AC诊断使能 (来自0x15/0x16)
+    input  wire         ac_diag_en,         // AC诊断使能 (仅从Hi-Z进入)
     // 通道控制输出
-    output reg  [1:0]   ch_state,           // 通道当前状态
+    output reg  [2:0]   ch_state,           // 通道当前状态 (3bit: 5态)
     output reg          ch_en,              // 通道使能 (PWM)
     output reg          ch_mute_mode,       // 静音模式
-    output reg          ch_diag_active,     // 诊断进行中
+    output reg          ch_diag_active,     // DC诊断进行中
+    output reg          ch_ac_active,       // AC诊断进行中 (新增)
     // 故障锁存输出 (用于0x0F寄存器组装)
     output wire         ch_fault_latched
 );
 ```
 
-**每通道信号宽度**: 输入8个信号, 输出6个信号  
-**4实例总信号**: 顶层需管理 4 × 14 = 56 根互联信号
+**每通道信号宽度**: 输入10个信号, 输出7个信号 (3bit ch_state)
+**4实例总信号**: 顶层需管理 4 × 17 = 68 根互联信号
 
 ---
 
@@ -362,6 +365,28 @@ module diagnostic_ctrl (
     input  wire [3:0]   ol_ch,              // CH1~4 开路
     input  wire [3:0]   sl_ch,              // CH1~4 负载短路
     input  wire [3:0]   lo_ch,              // CH1~4 线路输出
+    // 诊断FSM内部信号 (基于doc_src原始图更新)
+    // DC诊断顺序触发信号 (ch1_en~ch4_en, ch1_ol~ch4_ol, ch1_lo~ch4_lo)
+    output wire         ch1_en,             // CH1 S2GP测试使能
+    output wire         ch2_en,             // CH2 S2GP测试使能
+    output wire         ch3_en,             // CH3 S2GP测试使能
+    output wire         ch4_en,             // CH4 S2GP测试使能
+    output wire         ch1_ol,             // CH1 SL/OL测试使能
+    output wire         ch2_ol,             // CH2 SL/OL测试使能
+    output wire         ch3_ol,             // CH3 SL/OL测试使能
+    output wire         ch4_ol,             // CH4 SL/OL测试使能
+    output wire         ch1_lo,             // CH1 LO测试使能
+    output wire         ch2_lo,             // CH2 LO测试使能
+    output wire         ch3_lo,             // CH3 LO测试使能
+    output wire         ch4_lo,             // CH4 LO测试使能
+    output wire         done,               // DC诊断完成
+    output wire         ch1_ac_done,        // AC诊断CH1完成
+    output wire         ch2_ac_done,        // AC诊断CH2完成
+    output wire         ch3_ac_done,        // AC诊断CH3完成
+    output wire         ch4_ac_done,        // AC诊断CH4完成
+    // 诊断中止
+    input  wire         dc_ldg_abort,       // 0x09 bit7 DC诊断中止
+    input  wire         ac_ldg_abort,       // AC诊断中止
     // 诊断报告输出 → register_file (硬件写入)
     output reg  [7:0]   dc_diag_rpt1,       // 0x0C (CH1+CH2)
     output reg  [7:0]   dc_diag_rpt2,       // 0x0D (CH3+CH4)
