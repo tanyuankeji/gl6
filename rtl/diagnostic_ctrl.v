@@ -57,6 +57,13 @@ module diagnostic_ctrl (
     output wire [7:0]   ac_diag_rpt_ch3, ac_diag_rpt_ch4,
     output wire [7:0]   ac_phase_high, ac_phase_low,
     output wire [7:0]   ac_sti_high, ac_sti_low,
+    // ---- AC诊断模拟前端输入 ----
+    input  wire [7:0]   ac_imp_ch0,         // CH1 AC阻抗测量值
+    input  wire [7:0]   ac_imp_ch1,         // CH2
+    input  wire [7:0]   ac_imp_ch2,         // CH3
+    input  wire [7:0]   ac_imp_ch3,         // CH4
+    input  wire [15:0]  ac_phase_val,       // 相位测量值 (16bit)
+    input  wire [15:0]  ac_sti_val,         // 刺激值 (16bit)
     // ---- 时钟丢失 ----
     output wire         clock_lost,
     // ---- 保护状态 ----
@@ -157,13 +164,13 @@ module diagnostic_ctrl (
     ac_diagnostic_fsm u_ac_diag (
         .clk(clk), .rst_n(rst_n),
         .any_ch_ac(any_ch_ac), .dc_fsm_busy(dc_fsm_busy),
-        .ac_ldg_abort(1'b0),
+        .ac_ldg_abort(dc_ldg_abort),
         .ch_ac_active(ch_ac_active), .ch_diag_active(ch_diag_active),
-        .ac_imp_ch0(8'd0), .ac_imp_ch1(8'd0),
-        .ac_imp_ch2(8'd0), .ac_imp_ch3(8'd0),
-        .ac_phase_val(16'd0), .ac_sti_val(16'd0),
-        .ac_diag_ctrl1(8'd0), .ac_diag_ctrl2(8'd0),
-        .ac_timeout_val(24'h80000),
+        .ac_imp_ch0(ac_imp_ch0), .ac_imp_ch1(ac_imp_ch1),
+        .ac_imp_ch2(ac_imp_ch2), .ac_imp_ch3(ac_imp_ch3),
+        .ac_phase_val(ac_phase_val), .ac_sti_val(ac_sti_val),
+        .ac_diag_ctrl1(8'd0), .ac_diag_ctrl2(8'd0),  // TODO: 连接0x15/0x16
+        .ac_timeout_val(DIAG_TIMEOUT_VAL),
         .ac_diag_state(), .ac_fsm_busy(ac_fsm_busy),
         .ch_ac_done(ch_ac_done),
         .ac_diag_rpt_ch1(ac_diag_rpt_ch1), .ac_diag_rpt_ch2(ac_diag_rpt_ch2),

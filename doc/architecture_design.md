@@ -1,13 +1,19 @@
-# TAS6424E-Q1 RTL 架构设计文档
+# TAS6424E-Q1 RTL 架构设计文档 (v1.0 已废弃)
 
-> **版本**: v1.0.0  
+> **版本**: v1.0.0 (已废弃)  
 > **日期**: 2026-07-11  
-> **状态**: 待审核  
-> **关联文件**: `design_spec.md`（设计规格）、`module_design_detail.md`（模块详细设计）
+> **状态**: **已被 v6.0 取代** → 详见 `architecture_design_v2.md` + `state_machine_detailed_design.md`
 
 ---
 
-## 1. 架构概述
+## 1. 架构概述 (此文档已被取代)
+
+当前最新架构详见:
+- **架构总览**: `architecture_design_v2.md`
+- **状态机设计**: `state_machine_detailed_design.md` (v6.0, 3层24态)
+- **FSM设计**: `fsm_design.md` (v6.0)
+- **架构纠正**: `architecture_correction_v3.md`
+- **RTL代码**: `rtl/` 目录下13个模块
 
 ### 1.1 设计目标
 

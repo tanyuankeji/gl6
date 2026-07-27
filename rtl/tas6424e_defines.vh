@@ -100,35 +100,9 @@ parameter OTSD_RECOVERY_CYCLES = 32'hFFFFFF; // OTSD恢复: ~1.68s
 parameter DC_OBSERVATION_CYCLES = 24'd10000; // DC观察settle: 1ms
 
 // ========================================================================
-// 函数: 通道状态 → 0x0F编码转换
+// 说明: ch_state_to_ds 和 is_ro_reg 函数已移至各自使用模块中
+// (ch_state_to_ds → tas6424e_top.v, is_ro_reg → register_file.v)
+// 避免多个模块包含时函数重复定义
 // ========================================================================
-function [1:0] ch_state_to_ds;
-    input [2:0] state;
-    case (state)
-        CH_PLAY:          ch_state_to_ds = DS_PLAY;
-        CH_HIGH_Z:        ch_state_to_ds = DS_HI_Z;
-        CH_MUTE:          ch_state_to_ds = DS_MUTE;
-        CH_DC_DIAG_ENTRY: ch_state_to_ds = DS_DC_DIAG;
-        CH_AC_DIAG_ENTRY: ch_state_to_ds = DS_HI_Z;  // AC诊断上报为Hi-Z
-        default:          ch_state_to_ds = DS_HI_Z;  // IDLE → Hi-Z
-    endcase
-endfunction
-
-// ========================================================================
-// 函数: 只读寄存器判定
-// ========================================================================
-function is_ro_reg;
-    input [7:0] addr;
-    case (addr)
-        8'h0C, 8'h0D, 8'h0E,         // DC诊断报告
-        8'h0F,                         // 通道状态报告
-        8'h10, 8'h11, 8'h12, 8'h13,   // 故障/警告
-        8'h17, 8'h18, 8'h19, 8'h1A,   // AC诊断报告CH1~4
-        8'h1B, 8'h1C, 8'h1D, 8'h1E:   // AC相位/STI
-            is_ro_reg = 1'b1;
-        default:
-            is_ro_reg = 1'b0;
-    endcase
-endfunction
 
 `endif

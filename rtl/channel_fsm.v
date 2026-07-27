@@ -25,6 +25,7 @@ module channel_fsm #(
     input  wire [1:0]   ch_state_req,
     // 诊断控制
     input  wire         ldg_bypass,          // 0x09 bit0: 1=禁止自动诊断
+                                            // (当前仅手动诊断, 自动诊断未实现, 保留接口)
     input  wire         ac_diag_en,          // 0x15/0x16: AC诊断使能
     // 硬件MUTE引脚 (低有效, 经去抖)
     input  wire         hw_mute_n,           // 0=静音, 1=正常
@@ -75,20 +76,14 @@ module channel_fsm #(
             ch_state <= CH_IDLE;
         end else begin
 
-            // ---- 优先级0: 芯片非ACT → 强制Hi-Z ----
+            // 优先级从高到低: chip_active > ch_fault_latched(含global_fault) > abort
+            // ch_fault_latched 已包含 global_fault (见故障锁存逻辑), 无需重复检查
             if (!chip_active) begin
                 ch_state <= CH_HIGH_Z;
-            end
-            // ---- 优先级1: 全局故障 → 强制Hi-Z (修复#5) ----
-            else if (global_fault) begin
+            end else if (ch_fault_latched) begin
+                // ch_fault_latched 涵盖: 通道故障(OC/DC) + 全局故障(OV/UV/OTSD/clock_lost)
                 ch_state <= CH_HIGH_Z;
-            end
-            // ---- 优先级2: 通道故障 → 强制Hi-Z ----
-            else if (ch_fault_latched) begin
-                ch_state <= CH_HIGH_Z;
-            end
-            // ---- 优先级3: DC诊断中止 (修复#3) ----
-            else if (dc_ldg_abort && (ch_state == CH_DC_DIAG_ENTRY)) begin
+            end else if (dc_ldg_abort && (ch_state == CH_DC_DIAG_ENTRY)) begin
                 ch_state <= CH_HIGH_Z;
             end
             else begin

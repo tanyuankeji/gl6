@@ -62,29 +62,36 @@ module register_file (
     reg [7:0] reg_array [0:127];
 
     // ========================================================================
-    // I2C写逻辑 (仅R/W寄存器)
+    // I2C写逻辑 (仅R/W寄存器) + 特殊位自清除
     // ========================================================================
     integer i;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             for (i = 0; i < 128; i = i + 1)
                 reg_array[i] <= 8'd0;
-            // 加载默认值
-            reg_array[8'h01] <= 8'h32;    // 0x01
-            reg_array[8'h02] <= 8'h62;    // 0x02
-            reg_array[8'h03] <= 8'h04;    // 0x03
-            reg_array[8'h04] <= 8'h55;    // 0x04: 所有通道Hi-Z
-            reg_array[8'h05] <= 8'hCF;    // 0x05-08: 音量 0dB
+            reg_array[8'h01] <= 8'h32;
+            reg_array[8'h02] <= 8'h62;
+            reg_array[8'h03] <= 8'h04;
+            reg_array[8'h04] <= 8'h55;
+            reg_array[8'h05] <= 8'hCF;
             reg_array[8'h06] <= 8'hCF;
             reg_array[8'h07] <= 8'hCF;
             reg_array[8'h08] <= 8'hCF;
-            reg_array[8'h0A] <= 8'h11;    // 0x0A
-            reg_array[8'h0B] <= 8'h11;    // 0x0B
-            reg_array[8'h0F] <= 8'h55;    // 0x0F: 通道状态报告
-            reg_array[8'h28] <= 8'h0A;    // 0x28
+            reg_array[8'h0A] <= 8'h11;
+            reg_array[8'h0B] <= 8'h11;
+            reg_array[8'h0F] <= 8'h55;
+            reg_array[8'h28] <= 8'h0A;
         end else begin
             if (reg_wr_en && !is_ro_reg(reg_wr_addr))
                 reg_array[reg_wr_addr] <= reg_wr_data;
+
+            // soft_reset: 写入后自清除
+            if (reg_wr_en && (reg_wr_addr == 8'h00) && reg_wr_data[7])
+                reg_array[8'h00][7] <= 1'b0;
+
+            // clear_fault: 写入后自清除
+            if (reg_wr_en && (reg_wr_addr == 8'h21) && reg_wr_data[7])
+                reg_array[8'h21][7] <= 1'b0;
         end
     end
 
@@ -97,44 +104,45 @@ module register_file (
     end
 
     // ========================================================================
+    // 只读寄存器判定
+    // ========================================================================
+    function is_ro_reg;
+        input [7:0] addr;
+        case (addr)
+            8'h0C, 8'h0D, 8'h0E,
+            8'h0F,
+            8'h10, 8'h11, 8'h12, 8'h13,
+            8'h17, 8'h18, 8'h19, 8'h1A,
+            8'h1B, 8'h1C, 8'h1D, 8'h1E:
+                is_ro_reg = 1'b1;
+            default:
+                is_ro_reg = 1'b0;
+        endcase
+    endfunction
+
+    // ========================================================================
     // I2C读逻辑 (组合)
     // ========================================================================
     always @(*) reg_rd_data = reg_array[reg_rd_addr];
 
     // ========================================================================
-    // soft_reset (0x00 bit7) - 自清除脉冲
+    // soft_reset / clear_fault 脉冲生成 (寄存器位已在I2C块中自清除)
     // ========================================================================
-    reg soft_reset_d;
+    reg soft_reset_d, clear_fault_d;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            reg_array[8'h00][7] <= 1'b0;
-            soft_reset_d <= 1'b0;
+            soft_reset_d  <= 1'b0;
+            clear_fault_d <= 1'b0;
         end else begin
-            soft_reset_d <= 1'b0;
-            if (reg_wr_en && (reg_wr_addr == 8'h00) && reg_wr_data[7]) begin
-                reg_array[8'h00][7] <= 1'b0;
+            soft_reset_d  <= 1'b0;
+            clear_fault_d <= 1'b0;
+            if (reg_wr_en && (reg_wr_addr == 8'h00) && reg_wr_data[7])
                 soft_reset_d <= 1'b1;
-            end
-        end
-    end
-    assign soft_reset = soft_reset_d;
-
-    // ========================================================================
-    // clear_fault (0x21 bit7) - 自清除脉冲
-    // ========================================================================
-    reg clear_fault_d;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            reg_array[8'h21][7] <= 1'b0;
-            clear_fault_d <= 1'b0;
-        end else begin
-            clear_fault_d <= 1'b0;
-            if (reg_wr_en && (reg_wr_addr == 8'h21) && reg_wr_data[7]) begin
-                reg_array[8'h21][7] <= 1'b0;
+            if (reg_wr_en && (reg_wr_addr == 8'h21) && reg_wr_data[7])
                 clear_fault_d <= 1'b1;
-            end
         end
     end
+    assign soft_reset       = soft_reset_d;
     assign clear_fault_pulse = clear_fault_d;
 
     // ========================================================================

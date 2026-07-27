@@ -32,8 +32,11 @@ module tas6424e_top (
     input  wire         pvdd_uv_raw_i, pvdd_ov_raw_i,
     input  wire [3:0]   oc_ch_i, dc_ch_i,
     input  wire         por_vdd_i,
-    // 模拟前端诊断输入
-    input  wire [3:0]   s2g_ch_i, s2p_ch_i, ol_ch_i, sl_ch_i, lo_ch_i
+    // 模拟前端诊断输入 (DC诊断)
+    input  wire [3:0]   s2g_ch_i, s2p_ch_i, ol_ch_i, sl_ch_i, lo_ch_i,
+    // 模拟前端诊断输入 (AC诊断)
+    input  wire [7:0]   ac_imp_ch0, ac_imp_ch1, ac_imp_ch2, ac_imp_ch3,
+    input  wire [15:0]  ac_phase_val, ac_sti_val
 );
 
     // ========================================================================
@@ -140,6 +143,21 @@ module tas6424e_top (
     assign ch_state_req[2] = ch_state_ctrl[5:4];
     assign ch_state_req[3] = ch_state_ctrl[7:6];
 
+    // ========================================================================
+    // 0x0F上报 (函数: ch_state → datasheet编码, 定义在此处)
+    // ========================================================================
+    function [1:0] ch_state_to_ds;
+        input [2:0] state;
+        case (state)
+            CH_PLAY:          ch_state_to_ds = 2'b00;
+            CH_HIGH_Z:        ch_state_to_ds = 2'b01;
+            CH_MUTE:          ch_state_to_ds = 2'b10;
+            CH_DC_DIAG_ENTRY: ch_state_to_ds = 2'b11;
+            CH_AC_DIAG_ENTRY: ch_state_to_ds = 2'b01;
+            default:          ch_state_to_ds = 2'b01;
+        endcase
+    endfunction
+
     // 0x0F上报 (ch_state_to_ds在defines.vh中)
     wire [7:0] ch_state_report;
     assign ch_state_report = {ch_state_to_ds(ch_state_vec[3]),
@@ -220,6 +238,9 @@ module tas6424e_top (
         .oc_ch_i(oc_ch_i), .dc_ch_i(dc_ch_i),
         .por_vdd_i(por_vdd_i),
         .mclk_i(mclk_i), .sclk_i(sclk_i), .fsync_i(fsync_i),
+        .ac_imp_ch0(ac_imp_ch0), .ac_imp_ch1(ac_imp_ch1),
+        .ac_imp_ch2(ac_imp_ch2), .ac_imp_ch3(ac_imp_ch3),
+        .ac_phase_val(ac_phase_val), .ac_sti_val(ac_sti_val),
         .global_fault_irq(global_fault_irq), .ch_fault(ch_fault),
         .fault_trigger(fault_trigger), .warn_trigger(warn_trigger),
         .diag_hw_en(diag_hw_en), .diag_hw_addr(diag_hw_addr), .diag_hw_data(diag_hw_data),
