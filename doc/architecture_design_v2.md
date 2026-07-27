@@ -1,18 +1,19 @@
-# TAS6424E-Q1 RTL 架构设计文档 (v2.0)
+# TAS6424E-Q1 RTL 架构设计文档 (v6.0)
 
-> **版本**: v2.0.0  
-> **日期**: 2026-07-14  
-> **状态**: 架构完善阶段  
+> **版本**: v6.0.0  
+> **日期**: 2026-07-27  
+> **状态**: RTL代码实现完成, 13模块已编写并调试  
 > **基于**: TI TAS6424E-Q1 数据手册 (ZHCSO75A, 2021年11月修订版A)
 >
 > **关联文档**: 
-> - `state_machine_detailed_design.md` — 状态机详细设计 (基于doc_src原始图)
-> - `fsm_design.md` — 状态机总览 (v3.0)
+> - `state_machine_detailed_design.md` — 状态机详细设计 (v6.0)
+> - `fsm_design.md` — 状态机总览 (v6.0)
 > - `clock_reset_design.md` — 时钟与复位设计
 > - `register_map_design.md` — 寄存器映射详细设计
 > - `module_interface_design.md` — 模块接口设计
 > - `timing_diagram.md` — 时序图
 > - `module_functional_design.md` — 模块功能设计
+> - `architecture_correction_v3.md` — 架构纠正 (第3次)
 
 ---
 
@@ -262,12 +263,12 @@ tas6424e_top                              # 顶层模块 (56引脚 + 模拟输�
 │   ├── [内部] 硬件写入仲裁器
 │   └── [内部] soft_reset / clear_fault 脉冲生成
 │
-├── state_machine                         # 芯片主状态机
-│   ├── [内部] 2段式FSM (5状态)
-│   ├── [内部] 状态转换组合逻辑
-│   └── [内部] any_ch_diag/all_ch_hiz检测
+├── chip_top_controller                   # 芯片顶层控制器 (3态)
+│   ├── [内部] 3态FSM: POWERON → STANDBY ↔ ACT
+│   ├── [内部] 聚合信号: any_ch_play/all_ch_hiz 组合派生
+│   └── [内部] 振荡器使能
 │
-├── channel_fsm × 4                       # 通道状态机 (4实例, 6态, 含ENTRY桥接)
+├── channel_fsm × 4                       # 通道状态机 (generate for ×4, 6态)
 │   ├── [内部] 时序逻辑: ch_state[2:0] 时序寄存器
 │   ├── [内部] 故障锁存: ch_fault_latched
 │   ├── [内部] 组合逻辑: ch_en/ch_mute/ch_diag_active 派生
@@ -282,20 +283,24 @@ tas6424e_top                              # 顶层模块 (56引脚 + 模拟输�
 │   └── [内部] TDM时隙选择逻辑
 │
 ├── pwm_generator                         # PWM生成器
-│   ├── [内部] 三角波载波计数器 (复用, 4通道共享)
+│   ├── [内部] 锯齿波载波 (相位累加器, 4通道共享)
 │   ├── [内部] 4通道并行比较器
 │   ├── [内部] BTL正反相输出生成
 │   ├── [内部] MUTE模式50%占空比输出
 │   └── [内部] Hi-Z模式输出禁用
 │
-├── diagnostic_ctrl                       # 诊断控制器
+├── diagnostic_ctrl                       # 诊断控制器 (封装层)
+│   ├── [内部] protection (去毛刺 + OTSD恢复)
+│   ├── [内部] clock_monitor (时钟丢失检测)
+│   ├── [内部] fault_monitor (故障锁存 + 中断)
 │   ├── [内部] DC诊断FSM (15状态: IDLE/OBSERVATION/4阶段×4通道/DONE)
 │   ├── [内部] AC诊断FSM (6状态: IDLE/CH1~4_AC/DONE)
-│   ├── [内部] DC/AC诊断计时器
-│   ├── [内部] 诊断报告生成
-│   └── [内部] DC/AC模式选择
+│   └── [内部] 硬件写仲裁 (DC+AC → 单一diag_hw)
 │
-├── fault_monitor                         # 故障监控器
+├── hw_write_arbiter                      # 硬件写仲裁器
+│   └── [内部] 3路仲裁: ch_state + diag + fault
+│
+└── fault_monitor                         # 故障监控器 (包含在diagnostic_ctrl内)
 │   ├── [内部] 全局故障锁存 (OV/UV/OTSD/CLOCK_LOST)
 │   ├── [内部] 通道故障锁存 (OC/DC × 4)
 │   ├── [内部] 警告锁存 (OTW/OTW_CH/POR/CLIP)
