@@ -11,23 +11,30 @@
 
 ---
 
-## 0. 状态机层次总览 (v4.0 纠正)
+## 0. 状态机层次总览 (v5.0)
 
 ```
-顶层包装 (3态)    - PowerOn / STANDBY / ACT
+顶层包装 (3 态)      PowerOn / STANDBY / ACT
   │
-  └── 芯片主状态机 (5态)   - Hi-Z / Play / Mute / Single_Diag / Auto_Diag
+  └── 芯片主状态机 (5 态)   Hi-Z / Play / Mute / Single_Diag / Auto_Diag
        │
-       ├── 通道状态派生 (组合逻辑) - 每通道2bit, 由reg_04[7:0] + chip_state组合派生
+       ├── 通道 FSM ×4 (每通道 6 态, 含 ENTRY 桥接)
+       │     ├── IDLE
+       │     ├── CH_HIGH_Z
+       │     ├── CH_PLAY
+       │     ├── CH_MUTE
+       │     ├── CH_DC_DIAG_ENTRY  ★ DC 诊断桥接
+       │     └── CH_AC_DIAG_ENTRY  ★ AC 诊断桥接
        │
-       └── 诊断层
-              ├── DC诊断FSM (15态) - IDLE/OBSERVATION+3阶段×4通道+DONE
-              └── AC诊断FSM (6态)  - IDLE+CH1~4_AC+DONE
+       └── 诊断 FSM 层
+              ├── DC 诊断 FSM (15 态) — 通过 CH_DC_DIAG_ENTRY 桥接
+              └── AC 诊断 FSM (6 态)  — 通过 CH_AC_DIAG_ENTRY 桥接
 ```
 
-> **v4.0关键纠正**: 取消4个独立channel_fsm实例。通道状态由 `chip_state` + `reg_04[7:0]` 的组合逻辑直接派生，不是独立FSM。详见 `architecture_correction.md`。
+> **v5.0 关键变化**: 恢复 4 个独立 channel_fsm，每通道 6 态（含 2 个 ENTRY 桥接子状态）。
+> 这解决了 v4.0 中纯组合派生导致的"诊断状态无法跟踪"和"故障无法锁存"的问题。
 
-**4个层级, 18个FSM状态 + 组合派生通道编码**
+**5 个层级, 33 个 FSM 状态**
 
 ---
 
@@ -198,84 +205,154 @@ localparam CHIP_AUTO_DIAG   = 3'd4;  // 自动诊断 (故障后)
 
 ---
 
-## 3. 通道状态组合派生逻辑 (v4.0 纠正)
+## 3. 通道状态机 ×4 (v5.0 恢复, 6 态含 ENTRY 桥接)
 
-> **关键纠正**: 通道状态不是4个独立FSM，而是由 `chip_state` + `reg_04[7:0]` + `ac_diag_en[3:0]` 组合派生。
+> **v5.0 关键变化**: 恢复 4 个独立 channel_fsm 实例。
+> 每通道 6 态：(IDLE / CH_HIGH_Z / CH_PLAY / CH_MUTE / CH_DC_DIAG_ENTRY / CH_AC_DIAG_ENTRY)
+> 2 个 ENTRY 子状态是通道 FSM 与全局诊断 FSM 的桥接接口。
 
-### 3.1 派生算法
-
-```verilog
-// 通道 i (i=0,1,2,3) 状态由组合逻辑派生
-// 0x04编码: 00=PLAY, 01=HI_Z, 10=MUTE, 11=DC_DIAG
-
-wire [1:0] ch_state [0:3];
-
-assign ch_state[i] = (chip_state == CHIP_HI_Z || chip_state == CHIP_STANDBY)
-    ? 2'b01  // 强制Hi-Z
-    : (chip_state == CHIP_AC_DIAG && ac_diag_en[i])
-        ? 2'b11  // AC诊断
-        : ((chip_state == CHIP_SINGLE_DIAG || chip_state == CHIP_AUTO_DIAG)
-           && reg_04_ch[i] == 2'b11)
-            ? 2'b11  // DC诊断
-            : reg_04_ch[i];  // 直接使用0x04: 00=PLAY,01=HI_Z,10=MUTE
-```
-
-### 3.2 使能信号派生
+### 3.1 状态定义
 
 ```verilog
-assign ch_en[i]          = (ch_state[i] == 2'b00) || (ch_state[i] == 2'b10);
-assign ch_mute_mode[i]   = (ch_state[i] == 2'b10);
-assign ch_diag_active[i] = (ch_state[i] == 2'b11) && (chip_state != CHIP_AC_DIAG);
-assign ch_ac_active[i]   = (ch_state[i] == 2'b11) && (chip_state == CHIP_AC_DIAG);
+localparam CH_IDLE          = 3'd0;  // 上电初始
+localparam CH_HIGH_Z        = 3'd1;  // 默认/复位
+localparam CH_PLAY          = 3'd2;  // 播放
+localparam CH_MUTE          = 3'd3;  // 静音
+localparam CH_DC_DIAG_ENTRY = 3'd4;  // DC 诊断桥接 ★
+localparam CH_AC_DIAG_ENTRY = 3'd5;  // AC 诊断桥接 ★
 ```
 
-### 3.3 各主状态下的通道行为表
-
-| chip_state | 通道行为 |
-|-----------|---------|
-| CHIP_HI_Z | **强制所有通道Hi-Z (无视0x04)** |
-| CHIP_STANDBY | 强制所有通道Hi-Z |
-| CHIP_PLAY | 通道按0x04独立: 00=PLAY, 01=HI_Z, 10=MUTE |
-| CHIP_MUTE | 通道按0x04独立: 00=PLAY, 01=HI_Z, 10=MUTE |
-| CHIP_SINGLE_DIAG | 0x04=11的通道→DC_DIAG; 其余→HI_Z |
-| CHIP_AUTO_DIAG | 故障通道→DC_DIAG; 其余→HI_Z |
-| CHIP_AC_DIAG | ac_diag_en=1的通道→AC_DIAG; 其余→HI_Z |
-
-### 3.4 通道使能编码表
-
-| ch_state[1:0] | 条件 | ch_en | ch_mute | ch_diag | ch_ac | PWM |
-|--------------|------|-------|---------|---------|-------|-----|
-| 00 (PLAY) | chip_state in {PLAY, MUTE} | 1 | 0 | 0 | 0 | 音频调制 |
-| 01 (HI_Z) | 任意 | 0 | 0 | 0 | 0 | 高阻 |
-| 10 (MUTE) | chip_state in {PLAY, MUTE} | 1 | 1 | 0 | 0 | 50%方波 |
-| 11 (DC_DIAG) | chip_state in {SINGLE_DIAG, AUTO_DIAG} | 0 | 0 | 1 | 0 | 高阻(诊断) |
-| 11 (AC_DIAG) | chip_state == CHIP_AC_DIAG | 0 | 0 | 0 | 1 | 高阻(诊断) |
-
-> **说明**: 编码 2'b11 在不同 chip_state 下含义不同，通过 chip_state 区分 DC_DIAG 和 AC_DIAG。
-
-### 3.5 与四个通道的状态跳转图的对应
-
-图中 CH_HIGH_Z / CH_PLAY / CH_MUTE 重叠区域表示：
-- 每个宏状态同时包含4个通道的子状态
-- 通道子状态由 0x04[7:0] 的 2bit×4 编码字段决定
-- 不是4个独立的FSM，而是一张图中复合展示所有通道的行为
+### 3.2 状态转换图
 
 ```
-芯片主状态       通道可进入状态
-─────────────────────────────────────
-CHIP_HI_Z        只能CH_HIGH_Z (即使0x04配置其他)
-CHIP_PLAY        CH_PLAY / CH_MUTE / CH_HIGH_Z
-CHIP_MUTE        CH_PLAY / CH_MUTE / CH_HIGH_Z
-CHIP_SINGLE_DIAG CH_HIGH_Z / CH_SINGLE_DC_DIAG / CH_AC_DIAG
-CHIP_AUTO_DIAG   CH_HIGH_Z / CH_SINGLE_DC_DIAG / CH_AC_DIAG
+                  ┌─────────────┐
+                  │ 复位 (rst_n) │
+                  └──────┬──────┘
+                         │
+                         ▼
+                    ┌─────────┐
+                    │  IDLE   │
+                    └────┬────┘
+                         │ (1clk init)
+                         ▼
+      ┌─────────────────┌─────────┐────────────────────┐
+      │                  CH_HIGH_Z                     │
+      └─► PLAY  ◄────    (默认/复位)  ────► MUTE  ───┐ ▲
+              ──►  MUTE  ◄──                       │  │
+              ──►  DC_ENTRY ─► (ch_diag_done) ──►  │  │
+              ──►  AC_ENTRY ─► (ch_ac_done)   ──►  │  │
+                                                    │  │
+                          故障/ch_fault ────────────┘  │
+                          0x04 / 硬件引脚切换 ─────────┘
 ```
+
+### 3.3 完整转换条件表
+
+| 当前态 | 下一态 | 条件 | 备注 |
+|--------|--------|------|------|
+| IDLE | CH_HIGH_Z | (init, 1clk后) | 上电初始化 |
+| CH_HIGH_Z | CH_PLAY | 0x04=00, chip_state允许 | 进入播放 |
+| CH_HIGH_Z | CH_MUTE | 0x04=10, chip_state允许 | 进入静音 |
+| CH_HIGH_Z | CH_DC_DIAG_ENTRY | ch_dc_diag_en[i]=1 | DC 诊断触发 |
+| CH_HIGH_Z | CH_AC_DIAG_ENTRY | ch_ac_diag_en[i]=1 | AC 诊断触发 |
+| CH_PLAY | CH_MUTE | 0x04=10 / 硬件 MUTE | 切换 |
+| CH_PLAY | CH_DC_DIAG_ENTRY | ch_dc_diag_en[i]=1 | 进入 DC 诊断 |
+| CH_PLAY | CH_HIGH_Z | ch_fault / all_ch_hiz | 故障或回退 |
+| CH_MUTE | CH_PLAY | 0x04=00 / 硬件释放 | 切换 |
+| CH_MUTE | CH_DC_DIAG_ENTRY | ch_dc_diag_en[i]=1 | 进入 DC 诊断 |
+| CH_MUTE | CH_HIGH_Z | ch_fault / all_ch_hiz | 故障或回退 |
+| CH_DC_DIAG_ENTRY | CH_HIGH_Z | ch_diag_done[i]=1 | 全局 DC FSM 完成该通道 |
+| CH_AC_DIAG_ENTRY | CH_HIGH_Z | ch_ac_done[i]=1 | 全局 AC FSM 完成该通道 |
+| 任意 | CH_HIGH_Z | global_fault / STANDBY_N=0 | 顶层强制 |
+
+### 3.4 通道使能信号 (组合派生)
+
+```verilog
+assign ch_en[i]          = (ch_state[i] == CH_PLAY) || (ch_state[i] == CH_MUTE);
+assign ch_mute_mode[i]   = (ch_state[i] == CH_MUTE);
+assign ch_diag_active[i] = (ch_state[i] == CH_DC_DIAG_ENTRY);
+assign ch_ac_active[i]   = (ch_state[i] == CH_AC_DIAG_ENTRY);
+```
+
+### 3.5 各主状态下的通道行为
+
+| chip_state | 通道 FSM 行为 |
+|-----------|------------|
+| CHIP_STANDBY | 全部进入 CH_HIGH_Z (顶层强制) |
+| CHIP_HI_Z | 全部进入 CH_HIGH_Z |
+| CHIP_PLAY | 各通道按 0x04 独立配置: 00=PLAY, 01=HI_Z, 10=MUTE |
+| CHIP_MUTE | 各通道按 0x04 独立配置: 00=PLAY, 01=HI_Z, 10=MUTE |
+| CHIP_SINGLE_DIAG | 0x04=11 或 ac_diag_en=1 的通道进入对应 ENTRY |
+| CHIP_AUTO_DIAG | 故障通道自动进入 DC_DIAG_ENTRY |
 
 ### 3.6 关键设计注释
 
-1. **STANDBY_N取消信号会让任何0x04重新进入配置状态**
-2. **不会根据0x04进入AC诊断**（AC诊断需要0x15/0x16显式配置）
-3. **AC诊断只能在CH_HIGH_Z态进入**
-4. **CH_PLAY存在时溢载（过流）后状态是控制输出的**（强制回Hi-Z）
+1. **STANDBY_N=0 强制所有通道回 CH_HIGH_Z**
+2. **AC 诊断触发独立**: 通过 0x15/0x16 显式配置，不依赖 0x04
+3. **完成 DC 诊断后**: 通道回 CH_HIGH_Z (或回原 0x04 配置态)
+4. **过流故障**: 通道立即回 CH_HIGH_Z
+5. **ENTRY 子状态作用**: 通道 FSM 在此等待全局诊断 FSM 完成该通道的所有测试项
+
+### 3.7 RTL 实现要点
+
+```verilog
+// 通道 FSM 时序逻辑 (主状态机)
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        ch_state <= CH_IDLE;
+        ch_fault_latched <= 1'b0;
+    end else if (clear_fault) begin
+        ch_fault_latched <= 1'b0;
+    end else begin
+        // 故障锁存
+        if (ch_fault) ch_fault_latched <= 1'b1;
+
+        // 状态转换
+        case (ch_state)
+            CH_IDLE: ch_state <= CH_HIGH_Z;
+            
+            CH_HIGH_Z: begin
+                if (ch_dc_diag_en)
+                    ch_state <= CH_DC_DIAG_ENTRY;
+                else if (ch_ac_diag_en)
+                    ch_state <= CH_AC_DIAG_ENTRY;
+                else if (ch_state_req == CH_PLAY)
+                    ch_state <= CH_PLAY;
+                else if (ch_state_req == CH_MUTE)
+                    ch_state <= CH_MUTE;
+            end
+            
+            CH_PLAY: begin
+                if (ch_dc_diag_en)
+                    ch_state <= CH_DC_DIAG_ENTRY;
+                else if (ch_state_req == CH_MUTE)
+                    ch_state <= CH_MUTE;
+                else if (ch_fault_latched)
+                    ch_state <= CH_HIGH_Z;
+            end
+            
+            CH_MUTE: begin
+                if (ch_dc_diag_en)
+                    ch_state <= CH_DC_DIAG_ENTRY;
+                else if (ch_state_req == CH_PLAY)
+                    ch_state <= CH_PLAY;
+                else if (ch_fault_latched)
+                    ch_state <= CH_HIGH_Z;
+            end
+            
+            CH_DC_DIAG_ENTRY: begin
+                if (ch_diag_done)  // 全局 DC FSM 完成
+                    ch_state <= CH_HIGH_Z;
+            end
+            
+            CH_AC_DIAG_ENTRY: begin
+                if (ch_ac_done)  // 全局 AC FSM 完成
+                    ch_state <= CH_HIGH_Z;
+            end
+        endcase
+    end
+end
+```
 
 ---
 

@@ -84,42 +84,92 @@ wire addr_match = (shift_reg[7:1] == device_addr);
 
 ---
 
-### 3.0 通道状态组合派生逻辑 (v4.0 纠正)
+### 3.0 通道状态机 (v5.0 恢复 6 态, 含 ENTRY 桥接)
 
-> **关键纠正**: 非独立FSM。由 `chip_state + reg_04 + ac_diag_en` 组合派生。
+> **v5.0 关键变化**: 恢复 4 个独立 channel_fsm 实例。每通道 6 态 (IDLE/HIGH_Z/PLAY/MUTE/DC_DIAG_ENTRY/AC_DIAG_ENTRY)。
+> ENTRY 子状态是从通道 FSM 到全局诊断 FSM 的桥接。
 
-**派生算法** (纯组合逻辑, 0寄存器):
+**状态编码 (3 bit)**:
 
 ```verilog
-wire [1:0] ch_state [0:3];
-
-generate
-    for (genvar i = 0; i < 4; i = i + 1) begin : gen_ch_state
-        // 0x04编码: 00=PLAY, 01=HI_Z, 10=MUTE, 11=DC_DIAG/AC_DIAG
-        assign ch_state[i] = (chip_state == CHIP_HI_Z || chip_state == CHIP_STANDBY)
-            ? 2'b01  // 强制Hi-Z
-            : (chip_state == CHIP_AC_DIAG && ac_diag_en[i])
-                ? 2'b11  // AC诊断 (复用11编码)
-                : ((chip_state == CHIP_SINGLE_DIAG || chip_state == CHIP_AUTO_DIAG)
-                   && reg_04[i*2+:2] == 2'b11)
-                    ? 2'b11  // DC诊断
-                    : reg_04[i*2+:2];  // 直接使用0x04
-
-        assign ch_en[i]          = (ch_state[i] == 2'b00) || (ch_state[i] == 2'b10);
-        assign ch_mute_mode[i]   = (ch_state[i] == 2'b10);
-        assign ch_diag_active[i] = (ch_state[i] == 2'b11) && (chip_state != CHIP_AC_DIAG);
-        assign ch_ac_active[i]   = (ch_state[i] == 2'b11) && (chip_state == CHIP_AC_DIAG);
-    end
-endgenerate
-
-// 0x0F寄存器组装
-assign ch_state_report = {ch_state[0], ch_state[1], ch_state[2], ch_state[3]};
+localparam CH_IDLE          = 3'd0;  // 上电初始
+localparam CH_HIGH_Z        = 3'd1;  // 默认/复位
+localparam CH_PLAY          = 3'd2;  // 播放
+localparam CH_MUTE          = 3'd3;  // 静音
+localparam CH_DC_DIAG_ENTRY = 3'd4;  // DC 诊断桥接 ★
+localparam CH_AC_DIAG_ENTRY = 3'd5;  // AC 诊断桥接 ★
 ```
 
-**设计要点**:
-- 编码 2'b11 在不同 chip_state 下含义不同 (DC_DIAG vs AC_DIAG)
-- Hi-Z/STANDBY 强制覆盖 0x04
-- 纯组合逻辑，无时序依赖，无亚稳态风险
+**通道状态机时序逻辑**:
+
+```verilog
+module channel_fsm (
+    input  wire       clk, rst_n,
+    input  wire [2:0] chip_state,
+    input  wire       clear_fault,
+    input  wire [1:0] ch_state_req,    // 0x04配置
+    input  wire       ch_dc_diag_en,   // 主状态机触发
+    input  wire       ch_ac_diag_en,   // 主状态机触发
+    input  wire       ch_diag_done,    // 全局 DC FSM 完成该通道
+    input  wire       ch_ac_done,      // 全局 AC FSM 完成该通道
+    input  wire       ch_fault,        // 故障输入
+    output reg  [2:0] ch_state,
+    output wire       ch_en, ch_mute_mode, ch_diag_active, ch_ac_active,
+    output reg        ch_fault_latched
+);
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        ch_state <= CH_IDLE;
+        ch_fault_latched <= 1'b0;
+    end else if (clear_fault) begin
+        ch_fault_latched <= 1'b0;
+    end else begin
+        if (ch_fault) ch_fault_latched <= 1'b1;
+        case (ch_state)
+            CH_IDLE: ch_state <= CH_HIGH_Z;
+            CH_HIGH_Z: begin
+                if (ch_dc_diag_en)        ch_state <= CH_DC_DIAG_ENTRY;
+                else if (ch_ac_diag_en)   ch_state <= CH_AC_DIAG_ENTRY;
+                else if (ch_state_req == 2'b00) ch_state <= CH_PLAY;
+                else if (ch_state_req == 2'b10) ch_state <= CH_MUTE;
+            end
+            CH_PLAY: begin
+                if (ch_dc_diag_en)        ch_state <= CH_DC_DIAG_ENTRY;
+                else if (ch_state_req == 2'b10) ch_state <= CH_MUTE;
+                else if (ch_fault_latched) ch_state <= CH_HIGH_Z;
+            end
+            CH_MUTE: begin
+                if (ch_dc_diag_en)        ch_state <= CH_DC_DIAG_ENTRY;
+                else if (ch_state_req == 2'b00) ch_state <= CH_PLAY;
+                else if (ch_fault_latched) ch_state <= CH_HIGH_Z;
+            end
+            CH_DC_DIAG_ENTRY: if (ch_diag_done) ch_state <= CH_HIGH_Z;
+            CH_AC_DIAG_ENTRY: if (ch_ac_done)   ch_state <= CH_HIGH_Z;
+        endcase
+    end
+end
+
+// 组合派生使能信号
+assign ch_en          = (ch_state == CH_PLAY) || (ch_state == CH_MUTE);
+assign ch_mute_mode   = (ch_state == CH_MUTE);
+assign ch_diag_active = (ch_state == CH_DC_DIAG_ENTRY);
+assign ch_ac_active   = (ch_state == CH_AC_DIAG_ENTRY);
+endmodule
+```
+
+**ENTRY 子状态的作用**:
+
+| ENTRY 子状态 | 作用 | 退出条件 |
+|------------|------|----------|
+| CH_DC_DIAG_ENTRY | 等待全局 DC FSM 完成该通道的所有测试项 | ch_diag_done[i]=1 |
+| CH_AC_DIAG_ENTRY | 等待全局 AC FSM 完成该通道的测试 | ch_ac_done[i]=1 |
+
+**关键设计要点**:
+- 通道 FSM 是真正的 6 状态时序 FSM, ch_state[2:0] 是时序寄存器
+- ENTRY 子状态解决"通道等待全局诊断完成"的时序问题
+- ch_fault_latched 是故障锁存器, 仅 clear_fault 清除
+- STANDBY_N=0 强制所有通道回 CH_HIGH_Z
 
 ---
 

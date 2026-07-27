@@ -83,7 +83,7 @@ tas6424e_top
 ├── i2c_slave          inst_i2c (.scl_i, .sda_io, ...)
 ├── register_file      inst_reg  (.reg_wr_en, .reg_wr_data, ...)
 ├── state_machine      inst_sm   (.chip_state, .diag_trigger, ...)
-├── channel_state_decoder    inst_ch_state (.chip_state, .reg_04, .ac_diag_en, .ch_fault, ...)
+├── channel_fsm × 4    gen_ch[0:3] (.ch_state_req, .ch_dc_diag_en, .ch_ac_diag_en, .ch_diag_done, ...)
 ├── audio_interface    inst_audio (.sclk_i, .fsync_i, ...)
 ├── pwm_generator      inst_pwm  (.audio_data, .out_1p_o, ...)
 ├── diagnostic_ctrl    inst_diag (.diag_trigger, .diag_done, ...)
@@ -226,37 +226,49 @@ module state_machine (
 
 ---
 
-### 2.4 channel_state_decoder (v4.0 新增, 取代 ×4 channel_fsm)
+### 2.4 channel_fsm (v5.0 恢复 ×4 实例, 6 态含 ENTRY 桥接)
 
 ```verilog
-module channel_state_decoder (
-    // 全局状态
-    input  wire [2:0]   chip_state,         // 芯片主状态 (Hi-Z/Play/Mute/Single_Diag/Auto_Diag)
-    // 寄存器配置
-    input  wire [7:0]   reg_04,             // 0x04: 4通道×2bit编码
-    // AC诊断使能
-    input  wire [3:0]   ac_diag_en,         // 来自0x15/0x16
-    // 故障输入 (用于0x0F上报)
-    input  wire [3:0]   ch_fault,           // 来自fault_monitor
-    // 通道状态输出
-    output wire [1:0]   ch_state_ch1,       // CH1状态编码
-    output wire [1:0]   ch_state_ch2,       // CH2状态编码
-    output wire [1:0]   ch_state_ch3,       // CH3状态编码
-    output wire [1:0]   ch_state_ch4,       // CH4状态编码
-    // 通道使能信号
-    output wire [3:0]   ch_en,              // 4通道PWM使能
-    output wire [3:0]   ch_mute_mode,       // 4通道静音控制
-    output wire [3:0]   ch_diag_active,     // 4通道DC诊断激活
-    output wire [3:0]   ch_ac_active,       // 4通道AC诊断激活
-    // 状态报告 (编码到0x0F寄存器格式)
-    output wire [7:0]   ch_state_report     // {CH1,CH2,CH3,CH4} ×2bit → 0x0F
+module channel_fsm (
+    // 系统信号
+    input  wire         clk,
+    input  wire         rst_n,
+    // 全局状态约束
+    input  wire [2:0]   chip_state,         // 芯片主状态
+    input  wire         clear_fault,        // 清除故障锁存
+    // 通道请求配置
+    input  wire [1:0]   ch_state_req,       // 0x04对应位: 00=PLAY,01=HI_Z,10=MUTE,11=DC_DIAG
+    // 诊断触发 (来自主状态机/全局诊断 FSM)
+    input  wire         ch_dc_diag_en,      // 主状态机触发该通道 DC 诊断
+    input  wire         ch_ac_diag_en,      // 主状态机触发该通道 AC 诊断
+    input  wire         ch_diag_done,       // 全局 DC FSM 完成该通道
+    input  wire         ch_ac_done,         // 全局 AC FSM 完成该通道
+    // 故障输入
+    input  wire         ch_fault,           // 通道过流/DC (实时)
+    input  wire         ch_otsd,            // 通道过温关断 (经保护)
+    // 输出 (时序 + 组合)
+    output reg  [2:0]   ch_state,           // 6 态时序寄存器: IDLE/HIGH_Z/PLAY/MUTE/DC_DIAG_ENTRY/AC_DIAG_ENTRY
+    output wire         ch_en,              // PWM使能 (组合)
+    output wire         ch_mute_mode,       // 静音控制 (组合)
+    output wire         ch_diag_active,     // DC诊断激活 (组合)
+    output wire         ch_ac_active,       // AC诊断激活 (组合)
+    output reg          ch_fault_latched    // 通道故障锁存 (时序)
 );
 
-// 纯组合逻辑, 0寄存器, ~12输入, ~28输出
-// 实现: generate for + 组合assign
+// 模块特点:
+// - 时序部分: ch_state[2:0] 状态寄存器 (6 态需要 3bit)
+// - 时序部分: ch_fault_latched 故障锁存器
+// - 组合部分: ch_en/ch_mute_mode/ch_diag_active/ch_ac_active
+// - 6 态状态机 (含 ENTRY 桥接子状态)
+// - 由 ch_dc_diag_en/ch_ac_diag_en 触发进 ENTRY
+// - 由 ch_diag_done/ch_ac_done 退出 ENTRY
 ```
 
-**总信号**: ~40根 (远少于 v3.0 的68根)
+**每通道信号**:
+- 输入: 11 个 (clk, rst_n, chip_state, clear_fault, ch_state_req, 4 个诊断信号, ch_fault, ch_otsd)
+- 输出: 7 个 (ch_state, ch_en, ch_mute_mode, ch_diag_active, ch_ac_active, ch_fault_latched, in_dc_entry... )
+
+**4 实例总信号**: 顶层需管理 4 × 17 = 68 根互联信号
 
 ---
 
