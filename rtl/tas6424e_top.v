@@ -191,91 +191,43 @@ module tas6424e_top (
     endgenerate
 
     // ========================================================================
-    //  4. 诊断域: DC/AC诊断FSM + 保护电路 + 故障监控
+    //  4. 诊断域: 诊断控制器 (封装 DC/AC/保护/故障/时钟 为单一层)
     // ========================================================================
 
-    wire       dc_fsm_busy, ac_fsm_busy;
-    wire [7:0] dc_hw_addr, dc_hw_data, ac_hw_addr, ac_hw_data;
-    wire       dc_hw_en, ac_hw_en;
-    wire [7:0] fm_hw_addr, fm_hw_data;
-    wire       fm_hw_en;
-    wire       fault_trigger, warn_trigger;
-    wire       otw_int, otsd_int;
-    wire [3:0] otw_ch_int, otsd_ch_int;
-    wire       vbat_uv_int, vbat_ov_int, pvdd_uv_int, pvdd_ov_int;
     wire       clock_lost;
+    wire       fault_trigger, warn_trigger;
+    wire [7:0] diag_hw_addr, diag_hw_data, fault_hw_addr, fault_hw_data;
+    wire       diag_hw_en, fault_hw_en;
 
-    // DC诊断FSM
-    dc_diagnostic_fsm u_dc_diag (
+    diagnostic_ctrl u_diag_ctrl (
         .clk(clk), .rst_n(rst_n),
-        .any_ch_diag(any_ch_diag), .ac_fsm_busy(ac_fsm_busy),
+        .chip_active(chip_active),
+        .clear_fault_pulse(clear_fault_pulse),
         .dc_ldg_abort(dc_ldg_abort),
+        .ldg_bypass(ldg_bypass),
+        .otsd_auto_recovery(otsd_auto_recovery),
+        .dc_ramp_settle(dc_ramp_settle),
+        .pin_ctrl(pin_ctrl),
         .ch_diag_active(ch_diag_vec), .ch_ac_active(ch_ac_vec),
-        .s2g_ch(s2g_ch_i), .s2p_ch(s2p_ch_i), .sl_ch(sl_ch_i),
-        .ol_ch(ol_ch_i), .lo_ch(lo_ch_i),
-        .two_x_settle(dc_ramp_settle[0]),
-        .diag_timeout_val(DIAG_TIMEOUT_VAL),
-        .dc_diag_state(), .dc_fsm_busy(dc_fsm_busy),
-        .ch_diag_done(ch_diag_done),
-        .dc_diag_rpt1(), .dc_diag_rpt2(), .dc_diag_rpt3(),
-        .hw_wr_en(dc_hw_en), .hw_wr_addr(dc_hw_addr), .hw_wr_data(dc_hw_data)
-    );
-
-    // AC诊断FSM
-    ac_diagnostic_fsm u_ac_diag (
-        .clk(clk), .rst_n(rst_n),
-        .any_ch_ac(any_ch_ac), .dc_fsm_busy(dc_fsm_busy),
-        .ac_ldg_abort(1'b0),
-        .ch_ac_active(ch_ac_vec), .ch_diag_active(ch_diag_vec),
-        .ac_imp_ch0(8'd0), .ac_imp_ch1(8'd0),
-        .ac_imp_ch2(8'd0), .ac_imp_ch3(8'd0),
-        .ac_phase_val(16'd0), .ac_sti_val(16'd0),
-        .ac_diag_ctrl1(8'd0), .ac_diag_ctrl2(8'd0),
-        .ac_timeout_val(24'h80000),
-        .ac_diag_state(), .ac_fsm_busy(ac_fsm_busy),
-        .ch_ac_done(ch_ac_done),
-        .ac_diag_rpt_ch1(), .ac_diag_rpt_ch2(), .ac_diag_rpt_ch3(), .ac_diag_rpt_ch4(),
-        .ac_phase_high(), .ac_phase_low(), .ac_sti_high(), .ac_sti_low(),
-        .hw_wr_en(ac_hw_en), .hw_wr_addr(ac_hw_addr), .hw_wr_data(ac_hw_data)
-    );
-
-    // 保护电路
-    protection u_prot (
-        .clk(clk), .rst_n(rst_n),
-        .clear_fault(clear_fault_pulse), .otsd_auto_recovery(otsd_auto_recovery),
-        .otw_raw(otw_raw_i), .otsd_raw(otsd_raw_i),
-        .otw_ch_raw(otw_ch_raw_i), .otsd_ch_raw(otsd_ch_raw_i),
-        .vbat_uv_raw(vbat_uv_raw_i), .vbat_ov_raw(vbat_ov_raw_i),
-        .pvdd_uv_raw(pvdd_uv_raw_i), .pvdd_ov_raw(pvdd_ov_raw_i),
-        .otw_int(otw_int), .otsd_int(otsd_int),
-        .otw_ch_int(otw_ch_int), .otsd_ch_int(otsd_ch_int),
-        .vbat_uv_int(vbat_uv_int), .vbat_ov_int(vbat_ov_int),
-        .pvdd_uv_int(pvdd_uv_int), .pvdd_ov_int(pvdd_ov_int),
-        .otsd_recovered()
-    );
-
-    // 时钟监控器 (注意: clock_monitor内部含2级DFF CDC同步)
-    clock_monitor u_clkm (
-        .clk(clk), .rst_n(rst_n),
-        .mclk_sync(mclk_i), .sclk_sync(sclk_i), .fsync_sync(fsync_i),
-        .monitor_en(chip_active),
-        .clock_lost(clock_lost), .mclk_lost(), .sclk_lost(), .fsync_lost()
-    );
-
-    // 故障监控器
-    fault_monitor u_fault (
-        .clk(clk), .rst_n(rst_n),
-        .clear_fault(clear_fault_pulse),
-        .otw_int(otw_int), .otsd_int(otsd_int),
-        .otw_ch_int(otw_ch_int), .otsd_ch_int(otsd_ch_int),
-        .vbat_uv_int(vbat_uv_int), .vbat_ov_int(vbat_ov_int),
-        .pvdd_uv_int(pvdd_uv_int), .pvdd_ov_int(pvdd_ov_int),
-        .oc_ch(oc_ch_i), .dc_ch(dc_ch_i),
-        .clock_lost(clock_lost), .por_vdd(por_vdd_i),
+        .ch_diag_done(ch_diag_done), .ch_ac_done(ch_ac_done),
+        .any_ch_diag(any_ch_diag), .any_ch_ac(any_ch_ac),
+        .s2g_ch_i(s2g_ch_i), .s2p_ch_i(s2p_ch_i), .sl_ch_i(sl_ch_i),
+        .ol_ch_i(ol_ch_i), .lo_ch_i(lo_ch_i),
+        .otw_raw_i(otw_raw_i), .otsd_raw_i(otsd_raw_i),
+        .otw_ch_raw_i(otw_ch_raw_i), .otsd_ch_raw_i(otsd_ch_raw_i),
+        .vbat_uv_raw_i(vbat_uv_raw_i), .vbat_ov_raw_i(vbat_ov_raw_i),
+        .pvdd_uv_raw_i(pvdd_uv_raw_i), .pvdd_ov_raw_i(pvdd_ov_raw_i),
+        .oc_ch_i(oc_ch_i), .dc_ch_i(dc_ch_i),
+        .por_vdd_i(por_vdd_i),
+        .mclk_i(mclk_i), .sclk_i(sclk_i), .fsync_i(fsync_i),
         .global_fault_irq(global_fault_irq), .ch_fault(ch_fault),
         .fault_trigger(fault_trigger), .warn_trigger(warn_trigger),
-        .hw_ch_faults(), .hw_global_fault1(), .hw_global_fault2(), .hw_warnings(),
-        .hw_wr_en(fm_hw_en), .hw_wr_addr(fm_hw_addr), .hw_wr_data(fm_hw_data)
+        .diag_hw_en(diag_hw_en), .diag_hw_addr(diag_hw_addr), .diag_hw_data(diag_hw_data),
+        .fault_hw_en(fault_hw_en), .fault_hw_addr(fault_hw_addr), .fault_hw_data(fault_hw_data),
+        .dc_diag_rpt1(), .dc_diag_rpt2(), .dc_diag_rpt3(),
+        .ac_diag_rpt_ch1(), .ac_diag_rpt_ch2(), .ac_diag_rpt_ch3(), .ac_diag_rpt_ch4(),
+        .ac_phase_high(), .ac_phase_low(), .ac_sti_high(), .ac_sti_low(),
+        .clock_lost(clock_lost), .otsd_recovered()
     );
 
     // ========================================================================
@@ -324,9 +276,12 @@ module tas6424e_top (
         .ch_state_wr_en(ch_state_wr_en),
         .ch_state_wr_addr(ch_state_wr_addr),
         .ch_state_wr_data(ch_state_wr_data),
-        .dc_hw_en(dc_hw_en), .dc_hw_addr(dc_hw_addr), .dc_hw_data(dc_hw_data),
-        .ac_hw_en(ac_hw_en), .ac_hw_addr(ac_hw_addr), .ac_hw_data(ac_hw_data),
-        .fm_hw_en(fm_hw_en), .fm_hw_addr(fm_hw_addr), .fm_hw_data(fm_hw_data),
+        .diag_hw_en(diag_hw_en),
+        .diag_hw_addr(diag_hw_addr),
+        .diag_hw_data(diag_hw_data),
+        .fault_hw_en(fault_hw_en),
+        .fault_hw_addr(fault_hw_addr),
+        .fault_hw_data(fault_hw_data),
         .hw_wr_en(hw_wr_en), .hw_wr_addr(hw_wr_addr), .hw_wr_data(hw_wr_data)
     );
 
