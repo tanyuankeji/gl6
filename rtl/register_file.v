@@ -46,6 +46,7 @@ module register_file (
     // 0x04 通道状态控制 (核心!)
     output wire [7:0]   ch_state_ctrl,      // CH1~4 ×2bit: 00=PLAY,01=HI_Z,10=MUTE,11=DC
     // 0x09 DC诊断控制
+    output wire         dc_ldg_abort,       // bit7: DC_LDG_ABORT (修复#1)
     output wire         ldg_bypass,         // bit0: LDG_BYPASS
     output wire         ldg_lo_enable,      // bit1
     output wire [1:0]   dc_ramp_settle,     // bit6:5
@@ -100,6 +101,7 @@ module register_file (
             reg_array[8'h08] <= 8'hCF;
             reg_array[8'h0A] <= 8'h11;    // 0x0A: DC Diag Ctrl2
             reg_array[8'h0B] <= 8'h11;    // 0x0B: DC Diag Ctrl3
+            reg_array[8'h0F] <= 8'h55;    // 0x0F: 通道状态报告 (全部Hi-Z) 修复#3
             reg_array[8'h28] <= 8'h0A;    // 0x28: Misc Control 5
         end else begin
             if (reg_wr_en && !is_ro_reg(reg_wr_addr))
@@ -175,6 +177,7 @@ module register_file (
     assign tdm_slot_size = reg_array[8'h03][4];
     assign sap_mode     = reg_array[8'h03][2:0];
     assign ch_state_ctrl = reg_array[8'h04][7:0];
+    assign dc_ldg_abort = reg_array[8'h09][7];  // 修复#1
     assign ldg_bypass   = reg_array[8'h09][0];
     assign ldg_lo_enable = reg_array[8'h09][1];
     assign dc_ramp_settle = {reg_array[8'h09][6], reg_array[8'h09][5]};

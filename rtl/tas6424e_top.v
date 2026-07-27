@@ -61,7 +61,7 @@ module tas6424e_top (
 
     // ---- register_file ----
     wire       soft_reset, pbtl_ch12, pbtl_ch34;
-    wire       hpf_bypass, oc_level, ldg_bypass, ldg_lo_enable;
+    wire       hpf_bypass, oc_level, ldg_bypass, ldg_lo_enable, dc_ldg_abort;
     wire       clear_fault_pulse, otsd_auto_recovery, phase_sel_msb;
     wire       tdm_slot_sel, tdm_slot_size;
     wire [1:0] otw_threshold, volume_rate, gain_level, input_sr, dc_ramp_settle, output_phase_lsb;
@@ -165,6 +165,7 @@ module tas6424e_top (
         .tdm_slot_size(tdm_slot_size), .sap_mode(sap_mode),
         .ch_state_ctrl(ch_state_ctrl),
         .ldg_bypass(ldg_bypass), .ldg_lo_enable(ldg_lo_enable),
+        .dc_ldg_abort(dc_ldg_abort),    // 修复#1
         .dc_ramp_settle(dc_ramp_settle),
         .pin_ctrl(pin_ctrl), .ac_diag_en(ac_diag_en),
         .clear_fault_pulse(clear_fault_pulse), .otsd_auto_recovery(otsd_auto_recovery),
@@ -172,16 +173,21 @@ module tas6424e_top (
     );
 
     // ========================================================================
-    // 硬件写仲裁 (fault_monitor + dc_diag + ac_diag) → register_file
+    // 硬件写仲裁 (ch_state + fault_monitor + dc_diag + ac_diag) → register_file
     // ========================================================================
-    wire [1:0] hw_sel;
-    assign hw_sel = dc_hw_en ? 2'd1 : ac_hw_en ? 2'd2 : fm_hw_en ? 2'd3 : 2'd0;
+    wire [2:0] hw_sel;
+    assign hw_sel = ch_state_wr_en ? 3'd1
+                  : dc_hw_en       ? 3'd2
+                  : ac_hw_en       ? 3'd3
+                  : fm_hw_en       ? 3'd4 : 3'd0;
 
-    assign hw_wr_en   = (hw_sel != 2'd0);
-    assign hw_wr_addr = (hw_sel == 2'd1) ? dc_hw_addr
-                      : (hw_sel == 2'd2) ? ac_hw_addr : fm_hw_addr;
-    assign hw_wr_data = (hw_sel == 2'd1) ? dc_hw_data
-                      : (hw_sel == 2'd2) ? ac_hw_data : fm_hw_data;
+    assign hw_wr_en   = (hw_sel != 3'd0);
+    assign hw_wr_addr = (hw_sel == 3'd1) ? ch_state_wr_addr
+                      : (hw_sel == 3'd2) ? dc_hw_addr
+                      : (hw_sel == 3'd3) ? ac_hw_addr : fm_hw_addr;
+    assign hw_wr_data = (hw_sel == 3'd1) ? ch_state_wr_data
+                      : (hw_sel == 3'd2) ? dc_hw_data
+                      : (hw_sel == 3'd3) ? ac_hw_data : fm_hw_data;
 
     // ========================================================================
     // 通道FSM ×4
@@ -195,7 +201,7 @@ module tas6424e_top (
         .hw_mute_n(mute_n_db),
         .ch_fault(ch_fault[0]),
         .ch_diag_done(ch_diag_done[0]), .ch_ac_done(ch_ac_done[0]),
-        .dc_ldg_abort(1'b0),  // TODO: connect from 0x09[7]
+        .dc_ldg_abort(dc_ldg_abort),
         .ch_state(ch0_state),
         .ch_en(ch_en_vec[0]), .ch_mute_mode(ch_mute_vec[0]),
         .ch_diag_active(ch_diag_vec[0]), .ch_ac_active(ch_ac_vec[0]),
@@ -211,7 +217,7 @@ module tas6424e_top (
         .hw_mute_n(mute_n_db),
         .ch_fault(ch_fault[1]),
         .ch_diag_done(ch_diag_done[1]), .ch_ac_done(ch_ac_done[1]),
-        .dc_ldg_abort(1'b0),
+        .dc_ldg_abort(dc_ldg_abort),
         .ch_state(ch1_state),
         .ch_en(ch_en_vec[1]), .ch_mute_mode(ch_mute_vec[1]),
         .ch_diag_active(ch_diag_vec[1]), .ch_ac_active(ch_ac_vec[1]),
@@ -227,7 +233,7 @@ module tas6424e_top (
         .hw_mute_n(mute_n_db),
         .ch_fault(ch_fault[2]),
         .ch_diag_done(ch_diag_done[2]), .ch_ac_done(ch_ac_done[2]),
-        .dc_ldg_abort(1'b0),
+        .dc_ldg_abort(dc_ldg_abort),
         .ch_state(ch2_state),
         .ch_en(ch_en_vec[2]), .ch_mute_mode(ch_mute_vec[2]),
         .ch_diag_active(ch_diag_vec[2]), .ch_ac_active(ch_ac_vec[2]),
@@ -243,12 +249,50 @@ module tas6424e_top (
         .hw_mute_n(mute_n_db),
         .ch_fault(ch_fault[3]),
         .ch_diag_done(ch_diag_done[3]), .ch_ac_done(ch_ac_done[3]),
-        .dc_ldg_abort(1'b0),
+        .dc_ldg_abort(dc_ldg_abort),
         .ch_state(ch3_state),
         .ch_en(ch_en_vec[3]), .ch_mute_mode(ch_mute_vec[3]),
         .ch_diag_active(ch_diag_vec[3]), .ch_ac_active(ch_ac_vec[3]),
         .ch_fault_latched(ch_fault_vec[3])
     );
+
+    // ========================================================================
+    // 0x0F通道状态上报逻辑 (修复#2: 3bit→2bit映射 + 硬件写入)
+    // ========================================================================
+    function [1:0] ch_state_to_ds(input [2:0] state);
+        case (state)
+            3'd2: ch_state_to_ds = 2'b00;  // PLAY
+            3'd1: ch_state_to_ds = 2'b01;  // Hi-Z
+            3'd3: ch_state_to_ds = 2'b10;  // MUTE
+            3'd4: ch_state_to_ds = 2'b11;  // DC_DIAG_ENTRY → 上报为DC诊断
+            3'd5: ch_state_to_ds = 2'b01;  // AC_DIAG_ENTRY → 上报为Hi-Z
+            default: ch_state_to_ds = 2'b01; // IDLE → Hi-Z
+        endcase
+    endfunction
+
+    wire [7:0] ch_state_report;
+    assign ch_state_report = {ch_state_to_ds(ch3_state), ch_state_to_ds(ch2_state),
+                              ch_state_to_ds(ch1_state), ch_state_to_ds(ch0_state)};
+
+    // 硬件写入0x0F (状态变化时触发)
+    reg [7:0] ch_state_shadow;
+    reg       ch_state_hw_wr;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) {ch_state_shadow, ch_state_hw_wr} <= {8'd0, 1'b0};
+        else begin
+            ch_state_hw_wr <= 1'b0;
+            if (ch_state_report != ch_state_shadow) begin
+                ch_state_shadow <= ch_state_report;
+                ch_state_hw_wr <= 1'b1;
+            end
+        end
+    end
+
+    // 0x0F硬件写入仲裁 (与fault_monitor共享hw_wr, 需要合并)
+    // 简化: 0x0F使用ch_state_hw_wr, 由顶层hw_wr仲裁统一处理
+    wire ch_state_wr_en   = ch_state_hw_wr;
+    wire [7:0] ch_state_wr_addr = 8'h0F;
+    wire [7:0] ch_state_wr_data = ch_state_report;
 
     // ========================================================================
     // 保护电路
@@ -303,7 +347,7 @@ module tas6424e_top (
         .clk(clk), .rst_n(rst_n),
         .any_ch_diag(any_ch_diag),
         .ac_fsm_busy(ac_fsm_busy),
-        .dc_ldg_abort(1'b0),  // TODO: from 0x09[7]
+        .dc_ldg_abort(dc_ldg_abort),  // TODO: from 0x09[7]
         .ch_diag_active(ch_diag_vec),
         .ch_ac_active(ch_ac_vec),
         .s2g_ch(s2g_ch_i), .s2p_ch(s2p_ch_i), .sl_ch(sl_ch_i),

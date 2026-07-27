@@ -116,21 +116,37 @@ module fault_monitor (
     end
     assign hw_changed = ({chf, gf1, gf2, wn} != hw_shadow);
 
-    // 硬件写状态机 (简单序列: 0x10→0x11→0x12→0x13→停止)
+    // 硬件写状态机 (序列: 0x10→0x11→0x12→0x13→停止)
     reg [1:0] hw_seq;
+    reg       seq_busy;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             hw_wr_en   <= 1'b0;
             hw_seq     <= 2'd0;
+            seq_busy   <= 1'b0;
         end else begin
-            hw_wr_en <= 1'b0;
-            if (hw_changed) hw_seq <= 2'd0;  // 重新开始序列
-            case (hw_seq)
-                2'd0: if (hw_changed) begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h10; hw_wr_data <= chf; hw_seq <= 2'd1; end
-                2'd1:        begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h11; hw_wr_data <= gf1; hw_seq <= 2'd2; end
-                2'd2:        begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h12; hw_wr_data <= gf2; hw_seq <= 2'd3; end
-                2'd3:        begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h13; hw_wr_data <= wn;  hw_seq <= 2'd3; end
-            endcase
+            if (!seq_busy && hw_changed) begin
+                // 启动序列
+                seq_busy   <= 1'b1;
+                hw_wr_en   <= 1'b1;
+                hw_wr_addr <= 8'h10;
+                hw_wr_data <= chf;
+                hw_seq     <= 2'd1;
+            end else if (seq_busy) begin
+                case (hw_seq)
+                    2'd1: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h11; hw_wr_data <= gf1; hw_seq <= 2'd2; end
+                    2'd2: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h12; hw_wr_data <= gf2; hw_seq <= 2'd3; end
+                    2'd3: begin
+                        hw_wr_en <= 1'b1; hw_wr_addr <= 8'h13; hw_wr_data <= wn;
+                        hw_seq   <= 2'd0;
+                        seq_busy <= 1'b0;  // 序列完成, 回到idle
+                    end
+                    default: seq_busy <= 1'b0;
+                endcase
+            end else begin
+                hw_wr_en <= 1'b0;
+                seq_busy <= 1'b0;
+            end
         end
     end
 

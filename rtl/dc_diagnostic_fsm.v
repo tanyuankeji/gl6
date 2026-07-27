@@ -72,6 +72,7 @@ module dc_diagnostic_fsm (
     wire       stage_timer_done;            // 阶段计时完成
     reg  [1:0] current_ch;                  // 当前通道索引 (0-3)
     reg  [7:0] rpt1_shadow, rpt2_shadow, rpt3_shadow;  // 报告影子寄存器
+    reg  [1:0] hw_write_seq;               // 多寄存器写序列计数 (修复#4)
     wire       skip_ch0, skip_ch1, skip_ch2, skip_ch3;  // 跳过非诊断通道
 
     // 跳过非诊断通道 (修复#1: DC FSM仅处理ch_diag_active=1的通道)
@@ -102,6 +103,7 @@ module dc_diagnostic_fsm (
             rpt2_shadow    <= 8'd0;
             rpt3_shadow    <= 8'd0;
             hw_wr_en       <= 1'b0;
+            hw_write_seq   <= 2'd0;
             // 硬件写延迟
             {dc_diag_rpt1, dc_diag_rpt2, dc_diag_rpt3} <= 24'd0;
             {hw_wr_addr, hw_wr_data} <= 16'd0;
@@ -172,20 +174,36 @@ module dc_diagnostic_fsm (
                     DC_DIAG_CH4_LO: lo_test(3, DC_DONE);
 
                     // ====================================================
-                    // DONE: 全部完成, 写寄存器 + 通知通道
+                    // DONE: 全部完成, 顺序写3个寄存器 + 通知通道 (修复#4)
                     // ====================================================
                     DC_DONE: begin
-                        // 写寄存器文件
-                        dc_diag_rpt1 <= rpt1_shadow;
-                        dc_diag_rpt2 <= rpt2_shadow;
-                        dc_diag_rpt3 <= rpt3_shadow;
-                        hw_wr_en     <= 1'b1;
-                        hw_wr_addr   <= 8'h0C;  // 起始地址: 0x0C
-                        hw_wr_data   <= rpt1_shadow;
-                        // 通知所有参与诊断的通道
-                        ch_diag_done <= ch_diag_active;
-                        // 下一周期回IDLE
-                        dc_diag_state <= DC_DIAG_IDLE;
+                        case (hw_write_seq)
+                            2'd0: begin
+                                hw_wr_en   <= 1'b1;
+                                hw_wr_addr <= 8'h0C;
+                                hw_wr_data <= rpt1_shadow;
+                                hw_write_seq <= 2'd1;
+                            end
+                            2'd1: begin
+                                hw_wr_en   <= 1'b1;
+                                hw_wr_addr <= 8'h0D;
+                                hw_wr_data <= rpt2_shadow;
+                                hw_write_seq <= 2'd2;
+                            end
+                            2'd2: begin
+                                hw_wr_en   <= 1'b1;
+                                hw_wr_addr <= 8'h0E;
+                                hw_wr_data <= rpt3_shadow;
+                                hw_write_seq <= 2'd3;
+                                // 通知所有参与诊断的通道
+                                ch_diag_done <= ch_diag_active;
+                            end
+                            default: begin
+                                hw_wr_en     <= 1'b0;
+                                hw_write_seq <= 2'd0;
+                                dc_diag_state <= DC_DIAG_IDLE;
+                            end
+                        endcase
                     end
 
                     default: dc_diag_state <= DC_DIAG_IDLE;

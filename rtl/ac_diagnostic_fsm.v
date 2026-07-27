@@ -67,6 +67,7 @@ module ac_diagnostic_fsm (
     wire       stage_timer_done;
     reg  [7:0] rpt1_shadow, rpt2_shadow, rpt3_shadow, rpt4_shadow;
     reg [15:0] phase_shadow, sti_shadow;
+    reg  [3:0] hw_write_seq;  // 多寄存器写序列 (修复#5)
 
     assign stage_timer_done = (stage_timer >= ac_timeout_val);
     assign ac_fsm_busy = (ac_diag_state != AC_DIAG_IDLE) && (ac_diag_state != AC_DONE);
@@ -175,23 +176,24 @@ module ac_diagnostic_fsm (
                     end
 
                     // ====================================================
-                    // AC_DONE: 全部完成, 写寄存器 + 通知通道
+                    // AC_DONE: 顺序写8个寄存器 + 通知通道 (修复#5)
                     // ====================================================
                     AC_DONE: begin
-                        // 写寄存器文件
-                        ac_diag_rpt_ch1 <= rpt1_shadow;
-                        ac_diag_rpt_ch2 <= rpt2_shadow;
-                        ac_diag_rpt_ch3 <= rpt3_shadow;
-                        ac_diag_rpt_ch4 <= rpt4_shadow;
-                        {ac_phase_high, ac_phase_low} <= ac_phase_val;
-                        {ac_sti_high, ac_sti_low}     <= ac_sti_val;
-                        hw_wr_en   <= 1'b1;
-                        hw_wr_addr <= 8'h17;  // 起始地址: 0x17
-                        hw_wr_data <= rpt1_shadow;
-                        // 通知所有参与AC诊断的通道
-                        ch_ac_done <= ch_ac_active;
-                        // 下一周期回IDLE
-                        ac_diag_state <= AC_DIAG_IDLE;
+                        case (hw_write_seq)
+                            4'd0: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h17; hw_wr_data <= rpt1_shadow; hw_write_seq <= 4'd1; end
+                            4'd1: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h18; hw_wr_data <= rpt2_shadow; hw_write_seq <= 4'd2; end
+                            4'd2: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h19; hw_wr_data <= rpt3_shadow; hw_write_seq <= 4'd3; end
+                            4'd3: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h1A; hw_wr_data <= rpt4_shadow; hw_write_seq <= 4'd4; end
+                            4'd4: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h1B; hw_wr_data <= ac_phase_val[15:8]; hw_write_seq <= 4'd5; end
+                            4'd5: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h1C; hw_wr_data <= ac_phase_val[7:0];  hw_write_seq <= 4'd6; end
+                            4'd6: begin hw_wr_en <= 1'b1; hw_wr_addr <= 8'h1D; hw_wr_data <= ac_sti_val[15:8];   hw_write_seq <= 4'd7; end
+                            4'd7: begin
+                                hw_wr_en <= 1'b1; hw_wr_addr <= 8'h1E; hw_wr_data <= ac_sti_val[7:0];
+                                ch_ac_done <= ch_ac_active;
+                                hw_write_seq <= 4'd8;
+                            end
+                            default: begin hw_wr_en <= 1'b0; hw_write_seq <= 4'd0; ac_diag_state <= AC_DIAG_IDLE; end
+                        endcase
                     end
 
                     default: ac_diag_state <= AC_DIAG_IDLE;
