@@ -105,19 +105,9 @@ module pwm_generator (
     end
 
     // ========================================================================
-    // 三角波生成 (phase MSB判断方向, 反相得到三角)
+    // 载波: carrier_phase 直接作为锯齿波 (24bit, 0~16777215)
+    // 说明: 原三角波生成代码已移除, 使用锯齿波简化设计
     // ========================================================================
-    wire [23:0] triangle_wave [0:3];
-    genvar gi;
-    generate
-        for (gi = 0; gi < 4; gi = gi + 1) begin : gen_triangle
-            // phase[23]=0向上, [22:0]直接 → [23]=1向下, [22:0]取反
-            // 缩放到24bit有符号
-            assign triangle_wave[gi] = carrier_phase[gi][23]
-                ? {1'b0, ~carrier_phase[gi][22:0]}
-                : {1'b1, carrier_phase[gi][22:0]};
-        end
-    endgenerate
 
     // ========================================================================
     // 锁存音频数据 (增益缩放)
@@ -142,36 +132,35 @@ module pwm_generator (
     assign scale_ch4 = latched_ch4;
 
     // ========================================================================
-    // 通道0-3 独立比较器 + 输出控制
+    // 通道0-3 独立比较器 + BTL输出控制
+    // 使用锯齿波载波 (carrier_phase直接作为锯齿波, 功能等价)
+    // BTL: 音频偏移到无符号范围, 单边高单边低
     // ========================================================================
-    wire [3:0] pwm_p, pwm_m;  // 比较结果
+    wire [3:0] pwm_p, pwm_m;
+    wire [23:0] audio_shifted_ch1, audio_shifted_ch2, audio_shifted_ch3, audio_shifted_ch4;
 
-    // 比较: audio > carrier → high
-    // out_p = (scale > triangle); out_m = (-scale > triangle)
-    assign pwm_p[0] = $signed(scale_ch1) > $signed(triangle_wave[0]);
-    assign pwm_m[0] = $signed(-scale_ch1) > $signed(triangle_wave[0]);
-    assign pwm_p[1] = $signed(scale_ch2) > $signed(triangle_wave[1]);
-    assign pwm_m[1] = $signed(-scale_ch2) > $signed(triangle_wave[1]);
-    assign pwm_p[2] = $signed(scale_ch3) > $signed(triangle_wave[2]);
-    assign pwm_m[2] = $signed(-scale_ch3) > $signed(triangle_wave[2]);
-    assign pwm_p[3] = $signed(scale_ch4) > $signed(triangle_wave[3]);
-    assign pwm_m[3] = $signed(-scale_ch4) > $signed(triangle_wave[3]);
+    // 音频数据偏移到无符号范围: signed[-8388608, 8388607] → unsigned[0, 16777215]
+    assign audio_shifted_ch1 = scale_ch1 + 24'h800000;
+    assign audio_shifted_ch2 = scale_ch2 + 24'h800000;
+    assign audio_shifted_ch3 = scale_ch3 + 24'h800000;
+    assign audio_shifted_ch4 = scale_ch4 + 24'h800000;
+
+    // BTL比较: 锯齿波载波(0~16777215) vs 偏移后音频
+    // audio_shifted > carrier → out_p=1, out_m=0 (正向)
+    // audio_shifted < carrier → out_p=0, out_m=1 (反向)
+    // audio_shifted = carrier → 各占50% (零点)
+    assign pwm_p[0] = (audio_shifted_ch1 > carrier_phase[0]);
+    assign pwm_m[0] = !pwm_p[0];
+    assign pwm_p[1] = (audio_shifted_ch2 > carrier_phase[1]);
+    assign pwm_m[1] = !pwm_p[1];
+    assign pwm_p[2] = (audio_shifted_ch3 > carrier_phase[2]);
+    assign pwm_m[2] = !pwm_p[2];
+    assign pwm_p[3] = (audio_shifted_ch4 > carrier_phase[3]);
+    assign pwm_m[3] = !pwm_p[3];
 
     // ========================================================================
     // 输出控制: Hi-Z(00) / MUTE(10,50%) / PLAY(pwm) / DIAG(00)
     // ========================================================================
-    function [1:0] out_ctrl(input ch, input [3:0] en, input [3:0] mute, input [3:0] diag, input [3:0] ac);
-        begin
-            if (!en[ch] && !mute[ch] && !diag[ch] && !ac[ch])
-                out_ctrl = 2'b00;  // Hi-Z
-            else if (mute[ch])
-                out_ctrl = 2'b10;  // MUTE: out_p=1, out_m=0 (50%)
-            else if (en[ch])
-                out_ctrl = {pwm_p[ch], pwm_m[ch]};  // PLAY: PWM
-            else
-                out_ctrl = 2'b00;  // DIAG: Hi-Z
-        end
-    endfunction
 
     always @(posedge clk) begin
         {out_1p, out_1m} <= (ch_diag_active[0] || ch_ac_active[0] || !ch_en[0] && !ch_mute_mode[0]) ? 2'b00

@@ -87,14 +87,15 @@ endmodule
 // 通用去毛刺滤波器
 // ============================================================================
 module deglitch_filter #(
-    parameter CYCLES = 100
+    parameter CYCLES = 100,
+    parameter CNT_WIDTH = 10
 ) (
     input  wire       clk,
     input  wire       rst_n,
     input  wire       sig_raw,
     output wire       sig_filtered
 );
-    reg [$clog2(CYCLES+1)-1:0] cnt;
+    reg [CNT_WIDTH-1:0] cnt;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)

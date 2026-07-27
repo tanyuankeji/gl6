@@ -106,7 +106,10 @@ module i2c_slave (
     reg        sda_out;           // SDA输出驱动
     reg        sda_out_en;        // SDA输出使能 (0=高阻接收, 1=驱动)
 
-    // SDA双向控制
+    // SDA双向控制 (开漏输出: 仅拉低, 不主动拉高, 依赖外部上拉电阻)
+    // sda_out_en=0: Hi-Z (释放SDA, 外部上拉拉高)
+    // sda_out_en=1, sda_out=0: 拉低SDA (ACK/数据0)
+    // sda_out_en=1, sda_out=1: Hi-Z (释放SDA, 外部上拉拉高, 数据1)
     assign sda_io = sda_out_en ? (sda_out ? 1'bz : 1'b0) : 1'bz;
 
     always @(posedge clk or negedge rst_n) begin

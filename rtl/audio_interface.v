@@ -109,19 +109,12 @@ module audio_interface (
 
             // 在SCLK下降沿, 当bit_cnt达到锁存位置时锁存
             if (sclk_neg) begin
-                // I2S模式锁存 (第24/48位完成时)
-                if (bit_cnt == 6'd23) begin
-                    // 左通道锁存 (下一个SCLK的MSB已在shift_reg中)
-                    // 实际I2S延迟: MSB在bit_cnt=1, 所以24bit数据在bit_cnt=24
-                    // 简化: 直接锁存shift_reg
-                end
+                // 24位数据锁存 (I2S模式: 延迟1个SCLK, 24bit数据在bit_cnt=24)
                 if (bit_cnt == 6'd24) begin
-                    // 左通道数据就绪
                     latch_ch1 <= shift_reg_ch12;
                     latch_ch3 <= shift_reg_ch34;
                 end
                 if (bit_cnt == 6'd48) begin
-                    // 右通道数据就绪 → CH2和CH4
                     latch_ch2 <= shift_reg_ch12;
                     latch_ch4 <= shift_reg_ch34;
                     audio_valid <= 1'b1;
